@@ -1,6 +1,6 @@
 # nzxt-cam-tui
 
-A keyboard-first Linux hardware monitor and cooling-curve editor for NZXT and liquidctl-compatible devices. The TUI talks to the `nzxt-cam-hwd` service over a local Unix socket; it does not access hardware directly.
+A keyboard-first Linux hardware monitor and cooling-curve TUI editor for NZXT and liquidctl-compatible devices, writen in Rust. The TUI talks to the `nzxt-cam-hwd` service over a local Unix socket.
 
 ![Hardware dashboard and cooling-curve preview](docs/assets/screenshot.png)
 
