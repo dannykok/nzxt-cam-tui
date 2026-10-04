@@ -1,0 +1,14 @@
+[package]
+name = "nzxt-cam-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Versioned local IPC protocol for nzxt-cam-tui"
+
+[dependencies]
+nzxt-cam-core.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-util.workspace = true

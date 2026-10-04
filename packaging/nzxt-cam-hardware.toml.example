@@ -1,0 +1,33 @@
+# Optional service configuration. Copy only the settings needed to
+# /etc/nzxt-cam/hardware.toml; that file must be root-owned and not writable
+# by group or others. Replace the synthetic GPU identity with your own.
+
+# nvidia_uuid = "GPU-00000000-0000-0000-0000-000000000000"
+# nvidia_pci_bus_id = "00000000:01:00.0"
+
+# Motherboard control is disabled when host_control is absent.
+# Keep these entries commented until fan mapping, safe startup, minimum duty,
+# actual-load cooling and fault recovery have been assessed for your hardware.
+# The example minimum duties below are NOT established safe minima.
+# Only the exact board/chip identity shown here is supported.
+#
+# [host_control]
+# board_vendor = "Gigabyte Technology Co., Ltd."
+# board_name = "B650 AORUS ELITE AX ICE"
+# chip_name = "it8689"
+# chip_address = 0x0a40
+# platform_component = "it87.2624"
+#
+# [[host_control.channels]]
+# id = "it8689-fan-3-candidate"
+# name = "IT8689 fan 3 candidate"
+# pwm_channel = 3
+# fan_channel = 3
+# minimum_duty_percent = 30
+#
+# [[host_control.channels]]
+# id = "it8689-fan-4-candidate"
+# name = "IT8689 fan 4 candidate"
+# pwm_channel = 4
+# fan_channel = 4
+# minimum_duty_percent = 30

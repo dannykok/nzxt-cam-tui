@@ -1,0 +1,106 @@
+name: Linux CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Rust ${{ matrix.toolchain }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ['1.88.0', stable]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+      - name: Format and lint
+        if: matrix.toolchain == 'stable'
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Unit and integration tests
+        run: |
+          cargo test --locked --workspace --all-targets --all-features
+          cargo test --locked --workspace --all-features --doc
+      - name: Installer and packaging checks
+        run: |
+          bash scripts/build-release_tests.sh
+          bash scripts/install_tests.sh
+          scripts/verify-systemd.sh
+      - name: Build sanitized release binaries
+        run: scripts/build-release.sh
+      - name: Check release binaries for private build paths
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          private_paths = {
+              str(Path.cwd()),
+              os.environ['HOME'],
+              os.environ.get('CARGO_HOME', str(Path.home() / '.cargo')),
+          }
+          for name in ('nzxt-cam-hwd', 'nzxt-cam-tui'):
+              data = (Path('target/release') / name).read_bytes()
+              assert data.startswith(b'\x7fELF'), name
+              for path in private_paths:
+                  assert os.fsencode(path) not in data, f'{name}: unremapped build path'
+              assert b'/home/' not in data and b'/Users/' not in data, f'{name}: home-directory path'
+          PY
+
+  security:
+    name: Secrets and dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum-verified scanners
+        shell: bash
+        run: |
+          tools="$RUNNER_TEMP/nzxt-scanners"
+          mkdir -p "$tools/no-ignores" "$tools/source"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            -o "$tools/gitleaks.tar.gz"
+          printf '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  %s\n' "$tools/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$tools/gitleaks.tar.gz" -C "$tools" gitleaks
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz \
+            -o "$tools/cargo-audit.tar.gz"
+          printf '7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428  %s\n' "$tools/cargo-audit.tar.gz" | sha256sum -c -
+          tar -xzf "$tools/cargo-audit.tar.gz" -C "$tools" --strip-components=1 \
+            cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit
+          printf '[extend]\nuseDefault = true\n' > "$tools/gitleaks.toml"
+      - name: Scan full Git history and committed files
+        shell: bash
+        run: |
+          tools="$RUNNER_TEMP/nzxt-scanners"
+          "$tools/gitleaks" git . --log-opts='--all --full-history' \
+            --config "$tools/gitleaks.toml" --gitleaks-ignore-path "$tools/no-ignores" \
+            --ignore-gitleaks-allow --redact=100
+          git archive HEAD | tar -x -C "$tools/source"
+          "$tools/gitleaks" dir "$tools/source" \
+            --config "$tools/gitleaks.toml" --gitleaks-ignore-path "$tools/no-ignores" \
+            --ignore-gitleaks-allow --redact=100
+      - name: Audit dependencies without advisory suppressions
+        run: '"$RUNNER_TEMP/nzxt-scanners/cargo-audit" audit --deny warnings'

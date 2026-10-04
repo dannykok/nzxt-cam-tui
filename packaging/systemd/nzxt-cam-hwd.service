@@ -1,0 +1,18 @@
+[Unit]
+Description=NZXT CAM hardware service
+Requires=nzxt-cam-hwd.socket
+After=nzxt-cam-hwd.socket
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/nzxt-cam-hwd
+ExecStopPost=/usr/bin/nzxt-cam-hwd recover-service
+User=root
+Group=root
+StateDirectory=nzxt-cam
+StateDirectoryMode=0700
+Sockets=nzxt-cam-hwd.socket
+
+[Install]
+WantedBy=multi-user.target
+Also=nzxt-cam-hwd.socket
