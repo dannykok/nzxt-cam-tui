@@ -3,9 +3,9 @@
 //! This is authorization, not evidence of hardware state. A single service writer must
 //! durably mark the *exact* target InFlightUnknown before attempting ANY firmware write.
 //! A failed/uncertain write or crash leaves it blocked, including across restarts.
-//! Only definite confirmed success permits `mark_ready`; an operator may separately
-//! `rearm` an inspected intent. On startup only opted-in, auto-resume, Ready targets
-//! may be considered for replay; missing/offline targets require no state transition.
+//! Only definite confirmed success permits `mark_ready`. On startup only opted-in,
+//! auto-resume, Ready targets may be considered for replay; missing/offline targets
+//! require no state transition.
 //! `auto_resume` never triggers a write here. No hardware calls are made by this module.
 //!
 //! Provision /var/lib/nzxt-cam as root-owned mode 0700 before using the production
@@ -259,7 +259,7 @@ impl FileMonitorIntentStore {
         Ok(Some(saved))
     }
     /// Save opt-in/auto-resume and Ready targets. Never clears or edits an
-    /// InFlightUnknown target; `rearm` is the only operator-reviewed escape.
+    /// InFlightUnknown target; only confirmed success permits `mark_ready`.
     pub fn persist(&mut self, intent: &SavedMonitorIntent) -> Result<(), HardwareError> {
         intent.validate()?;
         let old = self.load()?;
@@ -298,11 +298,6 @@ impl FileMonitorIntentStore {
     }
     /// Call only after a definite confirmed successful write of this exact target.
     pub fn mark_ready(&mut self, target: &MonitorTarget) -> Result<(), HardwareError> {
-        self.transition(target, WriteState::InFlightUnknown, WriteState::Ready)
-    }
-    /// Explicit operator-reviewed rearm of a blocked, unchanged target; never
-    /// invoked by load/startup and never an automatic retry.
-    pub fn rearm(&mut self, target: &MonitorTarget) -> Result<(), HardwareError> {
         self.transition(target, WriteState::InFlightUnknown, WriteState::Ready)
     }
     fn transition(
@@ -502,8 +497,8 @@ mod tests {
             original
         );
         assert!(!dir.path().join(TEMP).exists());
-        store.rearm(&target).unwrap();
-        assert!(store.rearm(&target).is_err());
+        store.mark_ready(&target).unwrap(); // Caller attests definite confirmed success.
+        assert!(store.mark_ready(&target).is_err());
         record = store.load().unwrap().unwrap();
         record.auto_resume = false;
         record.opted_in = false;

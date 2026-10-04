@@ -1,6 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use nzxt_cam_core::{
+    ChannelId, CoolingChannel, CurvePoint, CurveState, Device, DeviceId, HardwareSnapshot,
+    HostChannelCapability, HostChannelPolicy, HostControlPolicy, HostControlState, HostCurve,
+    HostCurvePoint, HostTemperatureSource, KrakenDisplayMode, ReadingKind, TemperatureSource,
+};
 use nzxt_cam_protocol::{
     MAX_MONITORING_FIRMWARE_CURVES, MONITORING_FIRMWARE_CURVE_POINTS, MonitoringActivationOutcome,
     MonitoringActivationStatus, MonitoringActivationTarget, MonitoringDisplaySelection,
@@ -9,11 +14,6 @@ use nzxt_cam_protocol::{
 
 use crate::{
     config::AppConfig,
-    model::{
-        ChannelId, CoolingChannel, CurvePoint, CurveState, Device, DeviceId, HardwareSnapshot,
-        HostChannelCapability, HostChannelPolicy, HostControlPolicy, HostControlState, HostCurve,
-        HostCurvePoint, HostTemperatureSource, KrakenDisplayMode, ReadingKind, TemperatureSource,
-    },
     profile::{
         BuiltinProfile, CurveProfile, HostCurveProfile, MAX_PROFILE_NAME_CHARS, ProfileBinding,
         ProfileCurve, ProfileIntent, ProfileLibrary, ProfileRef, ProfileTarget,
@@ -316,10 +316,12 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(snapshot: HardwareSnapshot, backend_name: impl Into<String>) -> Self {
         Self::with_custom_profiles(snapshot, backend_name, Vec::new())
     }
 
+    #[cfg(test)]
     pub fn with_custom_profiles(
         snapshot: HardwareSnapshot,
         backend_name: impl Into<String>,
@@ -336,6 +338,7 @@ impl App {
         )
     }
 
+    #[cfg(test)]
     pub fn with_runtime_config(
         snapshot: HardwareSnapshot,
         backend_name: impl Into<String>,
@@ -698,6 +701,7 @@ impl App {
             .is_some_and(|channel| channel.curve_state == CurveState::Applied)
     }
 
+    #[cfg(test)]
     pub fn dirty_curve_count(&self) -> usize {
         self.dirty_curves.len()
     }
@@ -918,7 +922,7 @@ impl App {
             .snapshot
             .devices
             .iter()
-            .filter(|d| d.online && d.kind == crate::model::DeviceKind::LiquidCooler)
+            .filter(|d| d.online && d.kind == nzxt_cam_core::DeviceKind::LiquidCooler)
             .flat_map(|d| {
                 d.cooling_channels
                     .iter()
@@ -3747,7 +3751,7 @@ mod tests {
             .iter_mut()
             .find(|channel| channel.id.0 == "pump")
             .unwrap();
-        pump.source = crate::model::TemperatureSource::Gpu;
+        pump.source = nzxt_cam_core::TemperatureSource::Gpu;
         pump.min_duty = 40;
         pump.max_duty = 80;
         for point in &mut pump.points {
@@ -3768,7 +3772,7 @@ mod tests {
         assert_eq!(app.active_device().unwrap().cooling_channels.len(), 3);
         assert_eq!(
             app.active_channel().unwrap().source,
-            crate::model::TemperatureSource::Gpu
+            nzxt_cam_core::TemperatureSource::Gpu
         );
         assert_eq!(app.active_channel().unwrap().max_duty, 80);
         assert_eq!(app.selected_curve_point().unwrap(), dirty_point);

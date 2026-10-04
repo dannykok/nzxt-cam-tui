@@ -13,8 +13,8 @@ use std::os::unix::process::CommandExt;
 
 use nzxt_cam_core::{
     ChannelId, CoolingChannel, CurvePoint, CurveState, Device, DeviceId, DeviceKind,
-    HardwareSnapshot, HostChannelPolicy, HostControlPolicy, HostControlSnapshot, Reading,
-    ReadingKind, TemperatureSource,
+    HardwareSnapshot, HostChannelPolicy, HostControlPolicy, Reading, ReadingKind,
+    TemperatureSource,
 };
 use nzxt_cam_protocol::{
     MONITORING_FIRMWARE_CURVE_POINTS,
@@ -57,10 +57,6 @@ pub struct LiquidctlHardware {
 }
 
 impl LiquidctlHardware {
-    pub fn new() -> Self {
-        Self::with_io_lock(Arc::new(Mutex::new(())))
-    }
-
     /// A service manager and its LCD worker share this lock. It covers the
     /// entire liquidctl subprocess, never the 2-second wait or image render.
     pub(crate) fn with_io_lock(io_lock: Arc<Mutex<()>>) -> Self {
@@ -435,12 +431,6 @@ impl LiquidctlHardware {
     }
 }
 
-impl Default for LiquidctlHardware {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl HardwareOperations for LiquidctlHardware {
     fn cancellation_handle(&self) -> HardwareCancellation {
         self.cancellation.clone()
@@ -582,10 +572,6 @@ impl HardwareOperations for LiquidctlHardware {
 
     fn stop_host_control(&mut self) -> Result<(), HardwareError> {
         Err(unsupported_host_control())
-    }
-
-    fn host_control_snapshot(&self) -> HostControlSnapshot {
-        HostControlSnapshot::disabled()
     }
 
     fn host_control_shutdown_handle(&self) -> HostControlShutdownHandle {
@@ -2456,10 +2442,6 @@ mod tests {
         assert_eq!(
             hardware.update_host_control(&[update]).unwrap_err().kind(),
             HardwareErrorKind::Unsupported
-        );
-        assert_eq!(
-            hardware.host_control_snapshot(),
-            HostControlSnapshot::disabled()
         );
         hardware.host_control_shutdown_handle().request_shutdown();
         assert!(control.calls().is_empty());

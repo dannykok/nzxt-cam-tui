@@ -4,7 +4,7 @@
 //! framed connection and drives it with a small, current-thread Tokio runtime.
 
 use crate::backend::{BackendCancellation, BackendError, BackendErrorKind, HardwareBackend};
-use crate::model::{
+use nzxt_cam_core::{
     ChannelId, CurvePoint, DeviceId, HardwareSnapshot, HostChannelPolicy, HostControlPolicy,
     KrakenDisplayMode,
 };
@@ -937,7 +937,7 @@ mod linux {
             time::{Duration, Instant},
         };
 
-        use crate::model::HostControlState;
+        use nzxt_cam_core::HostControlState;
         use nzxt_cam_protocol::{
             ErrorMessage, MAX_FRAME_LENGTH, MAX_MONITORING_FIRMWARE_CURVES,
             MonitoringActivationStatus, MonitoringActivationTarget, Request,
@@ -1016,16 +1016,16 @@ mod linux {
 
         fn host_policy() -> HostControlPolicy {
             HostControlPolicy {
-                channels: vec![crate::model::HostChannelPolicy {
+                channels: vec![nzxt_cam_core::HostChannelPolicy {
                     channel_id: ChannelId::new("case-fan"),
-                    curve: crate::model::HostCurve {
-                        source: crate::model::HostTemperatureSource::CpuGpuMax,
+                    curve: nzxt_cam_core::HostCurve {
+                        source: nzxt_cam_core::HostTemperatureSource::CpuGpuMax,
                         points: vec![
-                            crate::model::HostCurvePoint {
+                            nzxt_cam_core::HostCurvePoint {
                                 temperature_millidegrees: 22_000,
                                 duty_percent: 30,
                             },
-                            crate::model::HostCurvePoint {
+                            nzxt_cam_core::HostCurvePoint {
                                 temperature_millidegrees: 100_000,
                                 duty_percent: 100,
                             },
@@ -1039,9 +1039,9 @@ mod linux {
             HardwareSnapshot {
                 devices: Vec::new(),
                 sequence,
-                host_control: crate::model::HostControlSnapshot {
+                host_control: nzxt_cam_core::HostControlSnapshot {
                     state,
-                    channels: vec![crate::model::HostChannelCapability {
+                    channels: vec![nzxt_cam_core::HostChannelCapability {
                         channel_id: ChannelId::new("case-fan"),
                         name: "Case fan".into(),
                         minimum_duty_percent: 30,

@@ -1,5 +1,9 @@
 mod curve_chart;
 
+use nzxt_cam_core::{
+    Device, DeviceId, DeviceKind, HostControlState, KrakenDisplayMode, MonitoringActualState,
+    MonitoringTargetIntent, ReadingKind,
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -10,10 +14,6 @@ use ratatui::{
 
 use crate::{
     app::{App, EditorMode, Modal, StatusKind},
-    model::{
-        Device, DeviceId, DeviceKind, HostControlState, KrakenDisplayMode, MonitoringActualState,
-        MonitoringTargetIntent, ReadingKind,
-    },
     profile::ProfileKind,
     theme::Theme,
 };
@@ -1420,7 +1420,7 @@ mod tests {
 
     #[test]
     fn queued_firmware_intent_does_not_render_as_applied() {
-        use crate::model::{
+        use nzxt_cam_core::{
             MonitoringActualState, MonitoringTargetIntent, MonitoringTargetSnapshot,
         };
         let mut backend = DemoBackend::new();
@@ -1443,7 +1443,7 @@ mod tests {
 
     #[test]
     fn pending_monitoring_display_does_not_claim_selected_face_is_applied() {
-        use crate::model::{
+        use nzxt_cam_core::{
             MonitoringActualState, MonitoringTargetIntent, MonitoringTargetSnapshot,
         };
         let mut backend = DemoBackend::new();
@@ -2193,7 +2193,7 @@ mod tests {
     fn live_unverified_curve_and_apply_confirmation_are_visible() {
         let mut backend = DemoBackend::new();
         let mut snapshot = backend.refresh().unwrap();
-        snapshot.devices[0].cooling_channels[0].curve_state = crate::model::CurveState::Unverified;
+        snapshot.devices[0].cooling_channels[0].curve_state = nzxt_cam_core::CurveState::Unverified;
         snapshot.monitoring.opted_in = true;
         let mut app = App::with_runtime_config(
             snapshot,
@@ -2239,7 +2239,7 @@ mod tests {
                 name: "my-custom-profile-123456789".into(),
                 curve: ProfileCurve::Host(
                     crate::profile::built_in_host_profiles(
-                        crate::model::HostTemperatureSource::Gpu,
+                        nzxt_cam_core::HostTemperatureSource::Gpu,
                         30,
                     )[0]
                     .curve
@@ -2304,7 +2304,7 @@ mod tests {
 
     #[test]
     fn it8689_rpm_and_mode_rows_keep_spaces_at_narrow_and_wide_widths() {
-        use crate::model::Reading;
+        use nzxt_cam_core::Reading;
 
         let device = Device {
             id: DeviceId::new("host-telemetry"),
@@ -2355,7 +2355,7 @@ mod tests {
             model: "Read-only host sensors".into(),
             kind: DeviceKind::FanController,
             online: true,
-            readings: vec![crate::model::Reading::new(
+            readings: vec![nzxt_cam_core::Reading::new(
                 "IT8689 fan 3 mode",
                 2.0,
                 "",

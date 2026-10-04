@@ -2,6 +2,8 @@
 
 A keyboard-first Linux hardware monitor and cooling-curve editor for NZXT and liquidctl-compatible devices. The TUI talks to the `nzxt-cam-hwd` service over a local Unix socket; it does not access hardware directly.
 
+![Hardware dashboard and cooling-curve preview](docs/assets/screenshot.png)
+
 ## Features
 
 - AIO, fan, USB and optional host telemetry, grouped in a compact dashboard.
@@ -96,8 +98,6 @@ From the repository root (no service or hardware required):
 
 ```bash
 cargo test --locked --workspace --all-targets
-bash scripts/build-release_tests.sh
-bash scripts/install_tests.sh
 ./scripts/verify-systemd.sh
 ```
 

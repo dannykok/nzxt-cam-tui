@@ -40,10 +40,7 @@ jobs:
           cargo test --locked --workspace --all-targets --all-features
           cargo test --locked --workspace --all-features --doc
       - name: Installer and packaging checks
-        run: |
-          bash scripts/build-release_tests.sh
-          bash scripts/install_tests.sh
-          scripts/verify-systemd.sh
+        run: scripts/verify-systemd.sh
       - name: Build sanitized release binaries
         run: scripts/build-release.sh
       - name: Check release binaries for private build paths

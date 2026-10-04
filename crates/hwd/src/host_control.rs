@@ -828,8 +828,10 @@ enum RecoveryBlockReason {
     PersistUncertain,
 }
 
+#[cfg(test)]
 #[derive(Default)]
-struct MemoryPolicyStore(Option<SavedPolicy>);
+pub(crate) struct MemoryPolicyStore(Option<SavedPolicy>);
+#[cfg(test)]
 impl PolicyStore for MemoryPolicyStore {
     fn load(&mut self) -> Result<Option<SavedPolicy>, HardwareError> {
         Ok(self.0.clone())
@@ -879,8 +881,8 @@ impl HostControlEngine {
             Box::new(FileRecoveryStore::new()),
             Box::new(sensors),
             Box::new(SystemMonotonicTime::new()),
+            Box::new(FilePolicyStore::new()),
         );
-        engine.policy_store = Box::new(FilePolicyStore::new());
         engine.nvidia_pci_bus_id = pci;
         engine
     }
@@ -892,6 +894,7 @@ impl HostControlEngine {
         recovery: Box<dyn RecoveryStore>,
         sensors: Box<dyn HostSensorSource>,
         clock: Box<dyn MonotonicTimeSource>,
+        policy_store: Box<dyn PolicyStore>,
     ) -> Self {
         Self {
             state: if config.is_some() {
@@ -906,7 +909,7 @@ impl HostControlEngine {
             recovery,
             sensors,
             clock,
-            policy_store: Box::new(MemoryPolicyStore::default()),
+            policy_store,
             policy_uncertain: false,
             restore_authorized: false,
             active_policy: None,
@@ -1830,7 +1833,6 @@ struct PublishedWorkerState {
     snapshot: HostControlSnapshot,
     last_error: Option<HardwareError>,
     termination_result: Option<Result<(), HardwareError>>,
-    terminated: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1871,7 +1873,6 @@ impl HostControlWorker {
             snapshot: engine.snapshot(),
             last_error: None,
             termination_result: None,
-            terminated: false,
         }));
         let (sender, receiver) = mpsc::channel();
         let stopping = Arc::new(AtomicBool::new(false));
@@ -2025,7 +2026,7 @@ fn run_worker(
         let mut snapshot = engine.snapshot();
         snapshot.state = HostControlState::RestoreRequired;
         snapshot.active_policy = None;
-        publish(&published, snapshot, Some(error.clone()), true);
+        publish(&published, snapshot, Some(error.clone()));
         fail_pending_commands(&receiver, &error);
     }
 }
@@ -2132,7 +2133,6 @@ fn worker_loop(
                 update_after_result(engine, published, &result, false);
                 let mut state = lock_published(published);
                 state.termination_result = Some(result.clone());
-                state.terminated = true;
                 drop(state);
                 let _ = response.send(result);
                 return;
@@ -2143,7 +2143,6 @@ fn worker_loop(
                 update_after_result(engine, published, &result, false);
                 let mut state = lock_published(published);
                 state.termination_result = Some(result);
-                state.terminated = true;
                 return;
             }
         }
@@ -2203,7 +2202,6 @@ fn publish(
     published: &Arc<Mutex<PublishedWorkerState>>,
     snapshot: HostControlSnapshot,
     last_error: Option<HardwareError>,
-    terminated: bool,
 ) {
     let mut state = lock_published(published);
     let mut snapshot = snapshot;
@@ -2216,13 +2214,8 @@ fn publish(
         eprintln!("host-control: {message}");
     }
     state.snapshot = snapshot;
-    state.termination_result = if terminated {
-        last_error.clone().map(Err)
-    } else {
-        None
-    };
+    state.termination_result = last_error.clone().map(Err);
     state.last_error = last_error;
-    state.terminated = terminated;
 }
 
 fn lock_published(
@@ -3140,6 +3133,7 @@ mod tests {
             recovery,
             Box::new(FakeSensors(state.clone())),
             Box::new(FakeClock(state)),
+            Box::new(MemoryPolicyStore::default()),
         )
     }
 
@@ -3203,6 +3197,96 @@ mod tests {
             "timed out waiting for worker state {expected:?}; current state is {:?}",
             worker.snapshot().state
         );
+    }
+
+    #[test]
+    fn injected_policy_store_drives_initialization_and_durable_lifecycle() {
+        struct RecordingPolicyStore {
+            saved: Arc<Mutex<Vec<SavedPolicy>>>,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl PolicyStore for RecordingPolicyStore {
+            fn load(&mut self) -> Result<Option<SavedPolicy>, HardwareError> {
+                self.calls.lock().unwrap().push("load");
+                Ok(self.saved.lock().unwrap().last().cloned())
+            }
+            fn persist(&mut self, saved: &SavedPolicy) -> Result<(), HardwareError> {
+                self.calls.lock().unwrap().push("persist");
+                self.saved.lock().unwrap().push(saved.clone());
+                Ok(())
+            }
+        }
+
+        let selected = policy(HostTemperatureSource::Cpu);
+        let identity = ConfigIdentity {
+            host_control: config(),
+            nvidia_uuid: Some("GPU-exact".into()),
+            nvidia_pci_bus_id: None,
+        };
+        let enabled = SavedPolicy::Enabled {
+            version: 1,
+            complete_policy: selected.clone(),
+            exact_config_identity: identity.clone(),
+        };
+        let saved = Arc::new(Mutex::new(vec![enabled.clone()]));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state = new_fake_state(None);
+        let mut engine = HostControlEngine::with_dependencies(
+            Some(config()),
+            Some("GPU-exact".into()),
+            Box::new(FakeSysfs(state.clone())),
+            Box::new(FakeRecovery(state.clone())),
+            Box::new(FakeSensors(state.clone())),
+            Box::new(FakeClock(state.clone())),
+            Box::new(RecordingPolicyStore {
+                saved: saved.clone(),
+                calls: calls.clone(),
+            }),
+        );
+
+        engine.initialize().unwrap();
+        assert_eq!(engine.snapshot().active_policy, Some(selected.clone()));
+        assert_eq!(*calls.lock().unwrap(), ["load"]);
+        assert_eq!(
+            saved.lock().unwrap().as_slice(),
+            std::slice::from_ref(&enabled)
+        );
+
+        let changed = changed_policy("front", HostTemperatureSource::Cpu);
+        let mut updated = selected.clone();
+        updated.channels[0] = changed.clone();
+        engine.update(&[changed]).unwrap();
+        let updated_saved = SavedPolicy::Enabled {
+            version: 1,
+            complete_policy: updated,
+            exact_config_identity: identity,
+        };
+        assert_eq!(saved.lock().unwrap().last(), Some(&updated_saved));
+
+        engine.stop().unwrap();
+        assert_eq!(
+            saved.lock().unwrap().last(),
+            Some(&SavedPolicy::Disabled { version: 1 })
+        );
+        engine.start(&selected).unwrap();
+        engine.shutdown().unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["load", "persist", "persist", "persist"]
+        );
+        assert_eq!(
+            *saved.lock().unwrap(),
+            [
+                enabled.clone(),
+                updated_saved,
+                SavedPolicy::Disabled { version: 1 },
+                enabled,
+            ]
+        );
+        let fake = state.lock().unwrap();
+        assert_eq!(fake.pwm, [(3, 63), (4, 63)].into());
+        assert_eq!(fake.enable, [(3, 2), (4, 2)].into());
+        assert!(fake.record.is_none());
     }
 
     #[test]
@@ -4040,6 +4124,7 @@ mod tests {
             Box::new(FileRecoveryStore::at(path)),
             Box::new(FakeSensors(fake_state.clone())),
             Box::new(FakeClock(fake_state.clone())),
+            Box::new(MemoryPolicyStore::default()),
         );
         assert!(engine.initialize().is_err());
         assert_eq!(engine.snapshot().state, HostControlState::RestoreRequired);
@@ -5028,6 +5113,7 @@ mod tests {
             Box::new(FakeRecovery(state.clone())),
             Box::new(FreshSensors),
             Box::new(AdvancingClock(state.clone())),
+            Box::new(MemoryPolicyStore::default()),
         );
         engine.start(&policy(HostTemperatureSource::Cpu)).unwrap();
         state.lock().unwrap().now += Duration::from_secs(1);
@@ -5341,8 +5427,15 @@ mod tests {
         assert!(fake.log.iter().any(|op| op == "write_pwm:4:63"));
     }
     fn persistent_engine(state: Arc<Mutex<FakeState>>, path: PathBuf) -> HostControlEngine {
-        harness_with_recovery(state.clone(), Box::new(FakeRecovery(state)))
-            .with_policy_store(Box::new(FilePolicyStore::at(path)))
+        HostControlEngine::with_dependencies(
+            Some(config()),
+            Some("GPU-exact".into()),
+            Box::new(FakeSysfs(state.clone())),
+            Box::new(FakeRecovery(state.clone())),
+            Box::new(FakeSensors(state.clone())),
+            Box::new(FakeClock(state)),
+            Box::new(FilePolicyStore::at(path)),
+        )
     }
 
     #[test]

@@ -13,6 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use nzxt_cam_core::{
+    ChannelId, CurvePoint, DeviceId, HardwareSnapshot, HostChannelPolicy, HostControlPolicy,
+    HostControlState, HostCurve, HostCurvePoint, HostTemperatureSource,
+};
 use nzxt_cam_hwd::{
     config::{HostChannelConfig, HostControlConfig},
     hardware::{HardwareCancellation, HardwareError, HardwareErrorKind, HardwareOperations},
@@ -22,6 +26,7 @@ use nzxt_cam_hwd::{
         SystemMonotonicTime, TimedTemperature,
     },
     it8689::{BOARD_NAME, BOARD_VENDOR, CHIP_ADDRESS, CHIP_NAME, PLATFORM_COMPONENT},
+    policy_store::{PolicyStore, SavedPolicy},
     server::serve_until,
 };
 use tokio::{net::UnixListener, sync::oneshot};
@@ -30,10 +35,6 @@ use super::linux::IpcBackend;
 use crate::{
     app::{App, AppCommand, StatusKind},
     backend::{BackendErrorKind, HardwareBackend},
-    model::{
-        ChannelId, CurvePoint, DeviceId, HardwareSnapshot, HostChannelPolicy, HostControlPolicy,
-        HostControlSnapshot, HostControlState, HostCurve, HostCurvePoint, HostTemperatureSource,
-    },
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +145,20 @@ impl RecoveryStore for FakeRecovery {
     }
 }
 
+#[derive(Default)]
+struct FakePolicyStore(Option<SavedPolicy>);
+
+impl PolicyStore for FakePolicyStore {
+    fn load(&mut self) -> Result<Option<SavedPolicy>, HardwareError> {
+        Ok(self.0.clone())
+    }
+
+    fn persist(&mut self, policy: &SavedPolicy) -> Result<(), HardwareError> {
+        self.0 = Some(policy.clone());
+        Ok(())
+    }
+}
+
 struct FakeClock(Arc<AtomicU64>);
 impl MonotonicTimeSource for FakeClock {
     fn now(&mut self) -> Result<Duration, HardwareError> {
@@ -221,9 +236,6 @@ impl HardwareOperations for WorkerHardware {
     fn stop_host_control(&mut self) -> Result<(), HardwareError> {
         self.worker.stop()
     }
-    fn host_control_snapshot(&self) -> HostControlSnapshot {
-        self.worker.snapshot()
-    }
     fn host_control_shutdown_handle(&self) -> HostControlShutdownHandle {
         self.worker.shutdown_handle()
     }
@@ -291,6 +303,7 @@ impl Service {
             Box::new(FakeRecovery(Arc::clone(&effects))),
             Box::new(FakeSensors),
             source.unwrap_or_else(|| Box::new(FakeClock(Arc::clone(&clock)))),
+            Box::new(FakePolicyStore::default()),
         );
         let hardware = WorkerHardware {
             worker: HostControlWorker::new(engine),

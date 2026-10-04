@@ -13,7 +13,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::DefaultProfile;
-use crate::model::{
+use nzxt_cam_core::{
     ChannelId, CurvePoint, DeviceId, HostCurve, HostCurvePoint, HostTemperatureSource,
 };
 
@@ -597,6 +597,7 @@ impl ProfileStore {
         }
         ProfileLibrary::from_legacy(profiles, &self.legacy_defaults)
     }
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

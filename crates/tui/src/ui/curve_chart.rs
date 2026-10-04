@@ -1,9 +1,7 @@
+use nzxt_cam_core::{CurvePoint, HostCurvePoint};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style, widgets::Widget};
 
-use crate::{
-    model::{CurvePoint, HostCurvePoint},
-    theme::Theme,
-};
+use crate::theme::Theme;
 
 pub trait ChartPoint {
     fn temperature_label(&self) -> String;

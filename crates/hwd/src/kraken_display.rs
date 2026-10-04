@@ -241,7 +241,9 @@ fn temperature(device: Option<&Device>, label: &str) -> Option<f64> {
 
 fn fields(mode: KrakenDisplayMode) -> &'static [usize] {
     match mode {
-        KrakenDisplayMode::BuiltinLiquid => &[],
+        KrakenDisplayMode::BuiltinLiquid => {
+            unreachable!("built-in liquid mode is handled by device firmware")
+        }
         KrakenDisplayMode::Cpu => &[0],
         KrakenDisplayMode::Gpu => &[1],
         KrakenDisplayMode::Liquid => &[2],
@@ -471,9 +473,6 @@ fn render(mode: KrakenDisplayMode, values: [Option<f64>; 3]) -> Vec<u8> {
     let mut rgb = vec![0u8; LCD_SIZE * LCD_SIZE * 3];
     let font = display_font();
     let slots = fields(mode);
-    if slots.is_empty() {
-        return png_rgb(LCD_SIZE as u32, LCD_SIZE as u32, &rgb);
-    }
     for (row, &field) in slots.iter().enumerate() {
         let height = LCD_SIZE / slots.len();
         let y = row * height;
@@ -663,6 +662,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "built-in liquid mode is handled by device firmware")]
+    fn builtin_liquid_is_not_a_host_rendered_preset() {
+        render(KrakenDisplayMode::BuiltinLiquid, [None; 3]);
+    }
+
+    #[test]
     fn bundled_font_repertoire_has_consistent_grayscale_masks() {
         let font = display_font();
         for character in "-0123456789°—CPUGLIQD".chars() {
@@ -706,6 +711,7 @@ mod tests {
     fn parallel_scalers_render_every_preset_deterministically() {
         let expected: Vec<_> = KrakenDisplayMode::ALL
             .into_iter()
+            .skip(1)
             .map(|mode| render(mode, [Some(53.2), Some(67.8), None]))
             .collect();
         let workers: Vec<_> = (0..8)
@@ -713,6 +719,7 @@ mod tests {
                 thread::spawn(|| {
                     KrakenDisplayMode::ALL
                         .into_iter()
+                        .skip(1)
                         .map(|mode| render(mode, [Some(53.2), Some(67.8), None]))
                         .collect::<Vec<_>>()
                 })

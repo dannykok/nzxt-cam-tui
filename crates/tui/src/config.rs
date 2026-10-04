@@ -1,10 +1,4 @@
-use std::{
-    env,
-    error::Error,
-    fmt, fs, io,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{env, error::Error, fmt, fs, io, io::Write, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -58,7 +52,8 @@ impl ConfigStore {
         Self { path: path.into() }
     }
 
-    pub fn path(&self) -> &Path {
+    #[cfg(test)]
+    pub fn path(&self) -> &std::path::Path {
         &self.path
     }
 

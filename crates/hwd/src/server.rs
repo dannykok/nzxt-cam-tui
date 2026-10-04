@@ -135,7 +135,7 @@ where
         tokio::task::spawn_blocking(move || lock_hardware(&hardware).initialize_host_control())
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut active: Option<JoinHandle<Option<PeerCredentials>>> = None;
+    let mut active: Option<JoinHandle<()>> = None;
 
     let result = loop {
         enum Event {
@@ -205,10 +205,7 @@ where
     result
 }
 
-async fn signal_and_drain_active(
-    shutdown: &watch::Sender<bool>,
-    active: Option<JoinHandle<Option<PeerCredentials>>>,
-) {
+async fn signal_and_drain_active(shutdown: &watch::Sender<bool>, active: Option<JoinHandle<()>>) {
     let _ = shutdown.send(true);
     if let Some(active) = active {
         let _ = active.await;
@@ -221,34 +218,35 @@ async fn handle_active_connection<H>(
     cancellation: HardwareCancellation,
     initialized: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
-) -> Option<PeerCredentials>
-where
+) where
     H: HardwareOperations,
 {
-    let peer_credentials = PeerCredentials::read_from(&stream)?;
+    if PeerCredentials::read_from(&stream).is_none() {
+        return;
+    }
     let mut framed = Framed::new(stream, JsonFrameCodec::new());
 
     let first_frame = tokio::select! {
         biased;
-        _ = wait_for_shutdown(&mut shutdown) => return None,
+        _ = wait_for_shutdown(&mut shutdown) => return,
         result = timeout(INITIAL_HELLO_TIMEOUT, framed.next()) => result,
     };
     let first_frame = match first_frame {
         Ok(Some(Ok(frame))) => frame,
-        Ok(None | Some(Err(_))) | Err(_) => return None,
+        Ok(None | Some(Err(_))) | Err(_) => return,
     };
 
     let hello = match from_value::<ClientHello>(first_frame) {
         Ok(hello) => hello,
         Err(_) => {
             let _ = send_rejection(&mut framed, RejectionCode::InvalidMessage).await;
-            return None;
+            return;
         }
     };
 
     if !hello.is_supported() {
         let _ = send_rejection(&mut framed, RejectionCode::UnsupportedVersion).await;
-        return None;
+        return;
     }
 
     let ready_sent = tokio::select! {
@@ -257,7 +255,7 @@ where
         result = framed.send(ServerResponse::ready_v6()) => result.is_ok(),
     };
     if !ready_sent {
-        return None;
+        return;
     }
 
     // Splitting is essential: while a blocking operation owns the hardware
@@ -269,7 +267,7 @@ where
             biased;
             _ = wait_for_shutdown(&mut shutdown) => {
                 disconnect_ready_hardware(&hardware, &initialized);
-                return Some(peer_credentials);
+                return;
             }
             frame = reader.next() => frame,
         };
@@ -277,7 +275,7 @@ where
         let request = match next_frame {
             None => {
                 disconnect_ready_hardware(&hardware, &initialized);
-                return Some(peer_credentials);
+                return;
             }
             Some(Ok(value)) => match from_value::<Request>(value) {
                 Ok(request) => request,
@@ -285,7 +283,7 @@ where
                     let response = invalid_request_response();
                     if !deliver_response(&mut writer, &mut reader, response, &mut shutdown).await {
                         disconnect_ready_hardware(&hardware, &initialized);
-                        return Some(peer_credentials);
+                        return;
                     }
                     continue;
                 }
@@ -295,7 +293,7 @@ where
                 let response = invalid_request_response();
                 let _ = deliver_final_response(&mut writer, response, &mut shutdown).await;
                 disconnect_ready_hardware(&hardware, &initialized);
-                return Some(peer_credentials);
+                return;
             }
         };
 
@@ -306,7 +304,7 @@ where
             };
             if !deliver_response(&mut writer, &mut reader, response, &mut shutdown).await {
                 disconnect_ready_hardware(&hardware, &initialized);
-                return Some(peer_credentials);
+                return;
             }
             continue;
         }
@@ -317,18 +315,18 @@ where
             _ = wait_for_shutdown(&mut shutdown) => {
                 cancel_and_drain(&cancellation, operation).await;
                 disconnect_ready_hardware(&hardware, &initialized);
-                return Some(peer_credentials);
+                return;
             }
             _unexpected = reader.next() => {
                 cancel_and_drain(&cancellation, operation).await;
                 disconnect_ready_hardware(&hardware, &initialized);
-                return Some(peer_credentials);
+                return;
             }
             result = &mut operation => match result {
                 Ok(response) => response,
                 Err(_) => {
                     disconnect_ready_hardware(&hardware, &initialized);
-                    return Some(peer_credentials);
+                    return;
                 }
             },
         };
@@ -336,7 +334,7 @@ where
         let response = preflight_operation_response(response);
         if !deliver_response(&mut writer, &mut reader, response, &mut shutdown).await {
             disconnect_ready_hardware(&hardware, &initialized);
-            return Some(peer_credentials);
+            return;
         }
     }
 }
@@ -970,6 +968,7 @@ mod tests {
             Box::new(RealWorkerRecovery(Arc::clone(&effects))),
             Box::new(RealWorkerSensors(Arc::clone(&effects))),
             Box::new(RealWorkerClock),
+            Box::new(crate::host_control::MemoryPolicyStore::default()),
         );
         (
             HostControlWorker::with_test_tick_interval(engine, Duration::from_secs(3_600)),
@@ -1196,10 +1195,6 @@ mod tests {
             } else {
                 Ok(())
             }
-        }
-
-        fn host_control_snapshot(&self) -> HostControlSnapshot {
-            self.snapshot.host_control.clone()
         }
 
         fn host_control_shutdown_handle(&self) -> HostControlShutdownHandle {
@@ -2570,7 +2565,7 @@ mod tests {
         );
 
         drop(client);
-        assert!(task.await.unwrap().is_some());
+        task.await.unwrap();
         assert_eq!(control.snapshot().disconnects, 1);
     }
 
@@ -2683,6 +2678,14 @@ mod tests {
     async fn actual_peer_credentials_are_captured() {
         let (client, service) = UnixStream::pair().unwrap();
         let expected = service.peer_cred().unwrap();
+        let credentials = PeerCredentials::read_from(&service).unwrap();
+        assert_eq!(credentials.pid, std::process::id());
+        assert_eq!(
+            credentials.pid,
+            u32::try_from(expected.pid().unwrap()).unwrap()
+        );
+        assert_eq!(credentials.uid, expected.uid());
+        assert_eq!(credentials.gid, expected.gid());
         let (hardware, _control) = FakeHardware::new();
         let cancellation = hardware.cancellation_handle();
         let hardware = Arc::new(Mutex::new(hardware));
@@ -2704,14 +2707,7 @@ mod tests {
         );
         drop(client);
 
-        let credentials = task.await.unwrap().unwrap();
-        assert_eq!(credentials.pid, std::process::id());
-        assert_eq!(
-            credentials.pid,
-            u32::try_from(expected.pid().unwrap()).unwrap()
-        );
-        assert_eq!(credentials.uid, expected.uid());
-        assert_eq!(credentials.gid, expected.gid());
+        task.await.unwrap();
     }
 
     #[tokio::test]

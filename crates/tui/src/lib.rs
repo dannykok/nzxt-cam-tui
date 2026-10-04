@@ -2,7 +2,6 @@ pub mod app;
 pub mod backend;
 pub mod config;
 pub mod ipc;
-pub mod model;
 pub mod profile;
 pub mod theme;
 pub mod ui;
@@ -19,7 +18,7 @@ use app::{App, AppCommand, CurveKey};
 use backend::{BackendCancellation, BackendError, BackendErrorKind, HardwareBackend};
 use config::{AppConfig, ConfigStore};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use model::{
+use nzxt_cam_core::{
     CurvePoint, DeviceId, HardwareSnapshot, HostChannelPolicy, HostControlPolicy, KrakenDisplayMode,
 };
 use nzxt_cam_protocol::{
@@ -550,7 +549,7 @@ fn send_app_command(
         }
         AppCommand::RememberHostProfiles { channel_policies } => {
             let known_applied = app.host_status_trusted
-                && app.host_control_state == model::HostControlState::Running
+                && app.host_control_state == nzxt_cam_core::HostControlState::Running
                 && !app.host_operation_busy
                 && host_operations.pending.is_none()
                 && !channel_policies.is_empty()
@@ -955,7 +954,7 @@ impl Drop for BackendWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model::HostControlState;
+    use nzxt_cam_core::HostControlState;
 
     struct TempProfiles {
         directory: std::path::PathBuf,
@@ -1039,7 +1038,7 @@ mod tests {
                 sequence: 0,
                 host_control: Default::default(),
                 kraken_display: Default::default(),
-                monitoring: model::MonitoringSnapshot {
+                monitoring: nzxt_cam_core::MonitoringSnapshot {
                     opted_in: true,
                     ..Default::default()
                 },
@@ -1153,8 +1152,8 @@ mod tests {
 
         fn apply_curve(
             &mut self,
-            _device_id: &crate::model::DeviceId,
-            _channel_id: &crate::model::ChannelId,
+            _device_id: &nzxt_cam_core::DeviceId,
+            _channel_id: &nzxt_cam_core::ChannelId,
             _points: &[CurvePoint],
         ) -> Result<(), BackendError> {
             Ok(())
@@ -1366,7 +1365,7 @@ mod tests {
                 .devices
                 .iter()
                 .flat_map(|device| &device.cooling_channels)
-                .all(|channel| channel.curve_state == crate::model::CurveState::Unverified)
+                .all(|channel| channel.curve_state == nzxt_cam_core::CurveState::Unverified)
         );
         assert_eq!(app.host_control_state, HostControlState::Available);
         assert!(!app.host_status_trusted);
@@ -1448,7 +1447,7 @@ mod tests {
                 .devices
                 .iter()
                 .flat_map(|device| &device.cooling_channels)
-                .all(|channel| channel.curve_state == crate::model::CurveState::Unverified)
+                .all(|channel| channel.curve_state == nzxt_cam_core::CurveState::Unverified)
         );
         assert_eq!(
             app.snapshot
@@ -1502,7 +1501,7 @@ mod tests {
                 .devices
                 .iter()
                 .flat_map(|device| &device.cooling_channels)
-                .all(|channel| channel.curve_state == crate::model::CurveState::Unverified)
+                .all(|channel| channel.curve_state == nzxt_cam_core::CurveState::Unverified)
         );
         assert!(!app.active_curve_is_verified());
         assert!(app.status.text.contains("connection lost after apply"));
@@ -1728,7 +1727,7 @@ mod tests {
         let available = backend.refresh().unwrap();
         let mut app = App::new(available.clone(), "DEMO");
         for channel in &mut app.host_editor.channels {
-            channel.curve.source = model::HostTemperatureSource::Gpu;
+            channel.curve.source = nzxt_cam_core::HostTemperatureSource::Gpu;
         }
         let policy = app.host_editor.policy();
         let (worker, received, events) = recording_worker();

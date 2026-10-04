@@ -17,22 +17,6 @@ pub struct HardwareSnapshot {
     pub monitoring: MonitoringSnapshot,
 }
 
-impl HardwareSnapshot {
-    pub fn cooling_device_count(&self) -> usize {
-        self.devices
-            .iter()
-            .filter(|device| !device.cooling_channels.is_empty())
-            .count()
-    }
-
-    pub fn reading_count(&self) -> usize {
-        self.devices
-            .iter()
-            .map(|device| device.readings.len())
-            .sum()
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Device {
@@ -128,8 +112,22 @@ mod tests {
             monitoring: Default::default(),
         };
 
-        assert_eq!(snapshot.cooling_device_count(), 1);
-        assert_eq!(snapshot.reading_count(), 3);
+        assert_eq!(
+            snapshot
+                .devices
+                .iter()
+                .filter(|device| !device.cooling_channels.is_empty())
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .devices
+                .iter()
+                .map(|device| device.readings.len())
+                .sum::<usize>(),
+            3
+        );
     }
 
     #[test]

@@ -92,6 +92,7 @@ impl HardwareError {
         &self.message
     }
 
+    #[cfg(test)]
     pub const fn write_outcome_unknown(&self) -> bool {
         matches!(
             self.kind,
@@ -207,8 +208,6 @@ pub trait HardwareOperations: Send + 'static {
     ) -> Result<(), HardwareError>;
 
     fn stop_host_control(&mut self) -> Result<(), HardwareError>;
-
-    fn host_control_snapshot(&self) -> HostControlSnapshot;
 
     fn host_control_shutdown_handle(&self) -> HostControlShutdownHandle;
 
@@ -336,10 +335,6 @@ impl HardwareManager {
             _host_control_lock: None,
         }
     }
-    fn record_write(&mut self, target: &MonitorTarget, result: &Result<(), HardwareError>) {
-        monitor_service::record_write(&mut self.monitor_actual, target, result);
-    }
-
     fn monitoring_snapshot(
         &self,
         snapshot: &HardwareSnapshot,
@@ -644,7 +639,7 @@ impl HardwareOperations for HardwareManager {
             &target,
             |id, channel, points| self.hardware.apply_firmware_curve(id, channel, points),
         );
-        self.record_write(&target, &result);
+        monitor_service::record_write(&mut self.monitor_actual, &target, &result);
         result
     }
 
@@ -692,10 +687,6 @@ impl HardwareOperations for HardwareManager {
 
     fn stop_host_control(&mut self) -> Result<(), HardwareError> {
         self.host_control.stop()
-    }
-
-    fn host_control_snapshot(&self) -> HostControlSnapshot {
-        self.host_control.snapshot()
     }
 
     fn host_control_shutdown_handle(&self) -> HostControlShutdownHandle {

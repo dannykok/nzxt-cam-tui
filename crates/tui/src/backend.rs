@@ -11,7 +11,7 @@ use nzxt_cam_protocol::{
     MonitoringActivationOutcome, MonitoringDisplaySelection, MonitoringFirmwareCurve,
 };
 
-use crate::model::{
+use nzxt_cam_core::{
     ChannelId, CoolingChannel, CurvePoint, Device, DeviceId, DeviceKind, HardwareSnapshot,
     HostChannelCapability, HostChannelPolicy, HostControlPolicy, HostControlState, HostCurve,
     KrakenDisplayMode, KrakenDisplaySnapshot, Reading, ReadingKind, TemperatureSource,
@@ -282,7 +282,7 @@ impl DemoBackend {
                     mode: KrakenDisplayMode::BuiltinLiquid,
                     last_error: None,
                 },
-                host_control: crate::model::HostControlSnapshot {
+                host_control: nzxt_cam_core::HostControlSnapshot {
                     state: HostControlState::Available,
                     channels: vec![
                         HostChannelCapability {
@@ -567,7 +567,14 @@ mod tests {
         let mut backend = DemoBackend::new();
         let snapshot = backend.refresh().expect("demo refresh should work");
 
-        assert_eq!(snapshot.cooling_device_count(), 2);
+        assert_eq!(
+            snapshot
+                .devices
+                .iter()
+                .filter(|device| !device.cooling_channels.is_empty())
+                .count(),
+            2
+        );
         for channel in snapshot
             .devices
             .iter()
@@ -590,16 +597,16 @@ mod tests {
                 .host_control
                 .channels
                 .iter()
-                .map(|capability| crate::model::HostChannelPolicy {
+                .map(|capability| nzxt_cam_core::HostChannelPolicy {
                     channel_id: capability.channel_id.clone(),
                     curve: HostCurve {
-                        source: crate::model::HostTemperatureSource::Cpu,
+                        source: nzxt_cam_core::HostTemperatureSource::Cpu,
                         points: vec![
-                            crate::model::HostCurvePoint {
+                            nzxt_cam_core::HostCurvePoint {
                                 temperature_millidegrees: 22_000,
                                 duty_percent: capability.minimum_duty_percent,
                             },
-                            crate::model::HostCurvePoint {
+                            nzxt_cam_core::HostCurvePoint {
                                 temperature_millidegrees: 100_000,
                                 duty_percent: 100,
                             },
@@ -657,13 +664,13 @@ mod tests {
                 .map(|capability| HostChannelPolicy {
                     channel_id: capability.channel_id.clone(),
                     curve: HostCurve {
-                        source: crate::model::HostTemperatureSource::Cpu,
+                        source: nzxt_cam_core::HostTemperatureSource::Cpu,
                         points: vec![
-                            crate::model::HostCurvePoint {
+                            nzxt_cam_core::HostCurvePoint {
                                 temperature_millidegrees: 20_000,
                                 duty_percent: capability.minimum_duty_percent,
                             },
-                            crate::model::HostCurvePoint {
+                            nzxt_cam_core::HostCurvePoint {
                                 temperature_millidegrees: 100_000,
                                 duty_percent: 100,
                             },
@@ -674,8 +681,8 @@ mod tests {
         };
         backend.start_host_control(&original).unwrap();
         let mut changed = original.channels.clone();
-        changed[0].curve.source = crate::model::HostTemperatureSource::Gpu;
-        changed[1].curve.source = crate::model::HostTemperatureSource::CpuGpuMax;
+        changed[0].curve.source = nzxt_cam_core::HostTemperatureSource::Gpu;
+        changed[1].curve.source = nzxt_cam_core::HostTemperatureSource::CpuGpuMax;
         let mut invalid = changed[1].clone();
         invalid.curve.points[0].duty_percent = 0;
         for batch in [

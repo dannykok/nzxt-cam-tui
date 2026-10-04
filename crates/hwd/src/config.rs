@@ -66,19 +66,9 @@ impl From<&HostChannelConfig> for HostChannelCapability {
     }
 }
 
-impl From<HostChannelConfig> for HostChannelCapability {
-    fn from(channel: HostChannelConfig) -> Self {
-        Self {
-            channel_id: channel.id,
-            name: channel.name,
-            minimum_duty_percent: channel.minimum_duty_percent,
-        }
-    }
-}
-
 impl HardwareConfig {
-    /// Loads a configuration from an arbitrary path without production
-    /// ownership checks. This is intended for tests and offline validation.
+    /// Test-only arbitrary-path loader without production ownership checks.
+    #[cfg(test)]
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let file = match fs::File::open(path) {
             Ok(file) => file,
