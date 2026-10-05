@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn worker_selection_transitions_and_reports_errors_without_client_or_device_io() {
         let root = tempfile::tempdir().unwrap();
-        let worker = KrakenDisplayWorker::with_sources(
+        let mut worker = KrakenDisplayWorker::with_sources(
             LiquidctlHardware::unavailable_for_test(),
             HostTelemetry::at_empty_test_root(root.path()),
         );
@@ -635,11 +635,18 @@ mod tests {
                 .unwrap()
                 .contains("liquidctl")
         );
+        // Check selection's immediate error reset without a new worker result
+        // racing the snapshot. The fake upload above still exercises reporting.
+        {
+            let mut state = worker.shared.0.lock().unwrap();
+            state.stopped = true;
+            worker.shared.1.notify_one();
+        }
+        worker.thread.take().unwrap().join().unwrap();
         worker.select(id, KrakenDisplayMode::GpuLiquid);
         let selected = worker.snapshot();
         assert_eq!(selected.mode, KrakenDisplayMode::GpuLiquid);
         assert_eq!(selected.last_error, None);
-        drop(worker); // joins the worker and removes its private image directory
     }
 
     #[test]
