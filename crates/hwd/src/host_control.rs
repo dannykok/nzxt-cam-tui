@@ -43,6 +43,8 @@ use crate::{
 pub const HOST_CONTROL_TICK_INTERVAL: Duration = Duration::from_secs(1);
 pub const HOST_CONTROL_SENSOR_FRESHNESS: Duration = Duration::from_secs(3);
 pub const HOST_CONTROL_DOWNWARD_HYSTERESIS_MILLIDEGREES: i64 = 2_000;
+const HOST_CONTROL_DOWNWARD_HOLD: Duration = Duration::from_secs(5);
+const HOST_CONTROL_DOWNWARD_RATE_MILLIPERCENT_PER_SECOND: i64 = 2_000;
 pub const HOST_CONTROL_RECOVERY_PATH: &str = "/run/nzxt-cam/host-control.json";
 const NORMAL_RECOVERY_VERSION: u8 = 3;
 const MAX_OBSERVATION_GAP: Duration = Duration::from_secs(2);
@@ -814,12 +816,44 @@ impl MonotonicTimeSource for SystemMonotonicTime {
     }
 }
 
+/// Per-channel response memory, separate from the health-observation deadline.
+/// Startup and accepted curve changes apply on the next tick without ramping.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DownwardRamp {
+    lower_since: Option<Duration>,
+    last_update: Option<Duration>,
+}
+
+impl DownwardRamp {
+    fn apply(&mut self, current: i64, target: i64, now: Duration) -> i64 {
+        let previous = self.last_update.replace(now);
+        if target >= current || previous.is_none() {
+            self.lower_since = None;
+            return target;
+        }
+        let lower_since = *self.lower_since.get_or_insert(now);
+        // Only time after the hold expires counts toward the downward rate.
+        // Repeated observations at the same timestamp cannot accelerate it.
+        let ramp_start = previous
+            .expect("an established response has a previous timestamp")
+            .max(lower_since.saturating_add(HOST_CONTROL_DOWNWARD_HOLD));
+        let elapsed = now.saturating_sub(ramp_start);
+        let decrease = i64::try_from(
+            HOST_CONTROL_DOWNWARD_RATE_MILLIPERCENT_PER_SECOND as u128 * elapsed.as_nanos()
+                / 1_000_000_000,
+        )
+        .unwrap_or(i64::MAX);
+        current.saturating_sub(decrease).max(target)
+    }
+}
+
 #[derive(Clone)]
 struct ActiveChannel {
     config: HostChannelConfig,
     policy: HostChannelPolicy,
     duty_millipercent: i64,
     commanded_pwm: u8,
+    downward_ramp: DownwardRamp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1181,6 +1215,7 @@ impl HostControlEngine {
                 policy: (*channel_policy).clone(),
                 duty_millipercent: evaluate_curve(&channel_policy.curve, temperature),
                 commanded_pwm: control::ENTRY_PWM,
+                downward_ramp: DownwardRamp::default(),
             });
         }
         let record = RecoveryRecord::from_config(&config, &original_pwm)?;
@@ -1472,6 +1507,7 @@ impl HostControlEngine {
                     .find(|c| c.config.id == policy.channel_id)
                     .expect("active channel is configured");
                 active.duty_millipercent = evaluate_curve(&policy.curve, temperature);
+                active.downward_ramp = DownwardRamp::default();
                 active.policy = policy.clone();
             }
         }
@@ -1517,11 +1553,11 @@ impl HostControlEngine {
             let (sample_time, sample) = self.observe_running_health(now, &mut check_abort)?;
             let previous = self.last_tick.expect("running tick has a deadline");
             let mut duties = Vec::with_capacity(self.active.len());
-            for channel in &self.active {
+            for channel in &mut self.active {
                 let temperature =
                     required_temperature(channel.policy.curve.source, sample, sample_time)?;
                 let direct = evaluate_curve(&channel.policy.curve, temperature);
-                let next = if direct >= channel.duty_millipercent {
+                let target = if direct >= channel.duty_millipercent {
                     direct
                 } else {
                     evaluate_curve(
@@ -1530,7 +1566,11 @@ impl HostControlEngine {
                     )
                     .min(channel.duty_millipercent)
                 };
-                duties.push(next);
+                duties.push(channel.downward_ramp.apply(
+                    channel.duty_millipercent,
+                    target,
+                    sample_time,
+                ));
             }
             for (index, duty) in duties.iter().copied().enumerate() {
                 let number = self.active[index].config.pwm_channel;
@@ -3807,7 +3847,9 @@ mod tests {
         let selected = policy(HostTemperatureSource::Cpu);
         engine.start(&selected).unwrap();
         assert_eq!(state.lock().unwrap().pwm[&3], 128);
-        for (time, cpu, expected) in [(101, 25_000, 95), (102, 20_000, 82), (103, 60_000, 192)] {
+        // Startup still applies the interpolated/hysteretic target directly;
+        // subsequent cooling holds that duty, while heating remains immediate.
+        for (time, cpu, expected) in [(101, 25_000, 95), (102, 20_000, 95), (103, 60_000, 192)] {
             let mut fake = state.lock().unwrap();
             fake.now = Duration::from_secs(time);
             fake.last_sample = sample(fake.now, Some(cpu), Some(45_000));
@@ -4997,8 +5039,71 @@ mod tests {
         assert_eq!((fake.pwm[&3], fake.pwm[&4]), (128, 128));
     }
 
+    fn tick_at(
+        engine: &mut HostControlEngine,
+        state: &Arc<Mutex<FakeState>>,
+        now: Duration,
+        cpu: i64,
+        gpu: i64,
+    ) {
+        {
+            let mut fake = state.lock().unwrap();
+            fake.now = now;
+            fake.last_sample = sample(now, Some(cpu), Some(gpu));
+        }
+        engine.tick(now).unwrap();
+    }
+
     #[test]
-    fn normal_ticks_apply_independent_up_and_down_targets_without_redundant_writes() {
+    fn downward_ramp_holds_then_uses_only_elapsed_time_after_hold() {
+        let mut ramp = DownwardRamp::default();
+        let mut duty = ramp.apply(100_000, 100_000, Duration::ZERO);
+        for milliseconds in [1_000, 2_000, 3_000, 4_000, 5_000, 5_900] {
+            duty = ramp.apply(duty, 30_000, Duration::from_millis(milliseconds));
+            assert_eq!(duty, 100_000);
+        }
+        // Hold began at 1s and ends at 6s. Even a tick spanning that boundary
+        // may only consume the time after 6s, not the entire tick interval.
+        for (milliseconds, expected) in [
+            (6_250, 99_500),
+            (6_750, 98_500),
+            (6_750, 98_500),
+            (7_000, 98_000),
+            (8_500, 95_000),
+        ] {
+            duty = ramp.apply(duty, 30_000, Duration::from_millis(milliseconds));
+            assert_eq!(duty, expected);
+        }
+        // Reaching a curve target never overshoots it, including minima.
+        duty = ramp.apply(duty, 94_500, Duration::from_secs(9));
+        assert_eq!(duty, 94_500);
+        assert_eq!(ramp.apply(duty, 30_000, Duration::from_secs(100)), 30_000);
+    }
+
+    #[test]
+    fn downward_ramp_restarts_hold_on_equal_demand_and_bypasses_it_on_heating() {
+        let mut ramp = DownwardRamp::default();
+        let mut duty = 100_000;
+        for (seconds, target, expected) in [
+            (0, 100_000, 100_000),
+            (1, 50_000, 100_000),
+            (4, 100_000, 100_000), // interrupted cooling cancels the hold
+            (5, 50_000, 100_000),
+            (9, 50_000, 100_000),
+            (10, 50_000, 100_000),
+            (11, 50_000, 98_000),
+            (12, 99_000, 99_000),   // even a small increase bypasses the ramp
+            (13, 100_000, 100_000), // full duty is immediate
+            (14, 50_000, 100_000),  // fresh hold after reheating
+            (18, 50_000, 100_000),
+        ] {
+            duty = ramp.apply(duty, target, Duration::from_secs(seconds));
+            assert_eq!(duty, expected);
+        }
+    }
+
+    #[test]
+    fn normal_ticks_increase_immediately_and_ramp_down_independent_groups() {
         let (mut engine, state) = harness();
         let mut selected = policy(HostTemperatureSource::Cpu);
         selected.channels[1].curve.source = HostTemperatureSource::Gpu;
@@ -5006,15 +5111,9 @@ mod tests {
         for (time, cpu, gpu, front, rear) in [
             (101, 50_000, 45_000, 160, 144),
             (102, 80_000, 45_000, 255, 144),
-            (103, 20_000, 80_000, 82, 255),
+            (103, 20_000, 80_000, 255, 255),
         ] {
-            let now = Duration::from_secs(time);
-            {
-                let mut fake = state.lock().unwrap();
-                fake.now = now;
-                fake.last_sample = sample(now, Some(cpu), Some(gpu));
-            }
-            engine.tick(now).unwrap();
+            tick_at(&mut engine, &state, Duration::from_secs(time), cpu, gpu);
             assert_eq!(state.lock().unwrap().pwm, [(3, front), (4, rear)].into());
         }
         let writes_before = state
@@ -5024,21 +5123,167 @@ mod tests {
             .iter()
             .filter(|op| op.starts_with("write_pwm:"))
             .count();
-        {
-            let mut fake = state.lock().unwrap();
-            fake.now = Duration::from_secs(104);
-            fake.last_sample = sample(fake.now, Some(20_000), Some(80_000));
+        for time in 104..=108 {
+            tick_at(
+                &mut engine,
+                &state,
+                Duration::from_secs(time),
+                20_000,
+                80_000,
+            );
+            let fake = state.lock().unwrap();
+            assert_eq!(fake.pwm, [(3, 255), (4, 255)].into());
+            assert_eq!(
+                fake.log
+                    .iter()
+                    .filter(|op| op.starts_with("write_pwm:"))
+                    .count(),
+                writes_before
+            );
         }
-        engine.tick(Duration::from_secs(104)).unwrap();
+        // CPU cooling retains the 2°C hysteretic floor (32%), while the GPU
+        // group remains at 100%. The ramp converges without redundant writes.
+        for time in 109..=143 {
+            tick_at(
+                &mut engine,
+                &state,
+                Duration::from_secs(time),
+                20_000,
+                80_000,
+            );
+            let duty = (100_000 - 2_000 * (time as i64 - 108)).max(32_000);
+            assert_eq!(engine.active[0].duty_millipercent, duty);
+            assert_eq!(
+                state.lock().unwrap().pwm,
+                [(3, duty_to_pwm(duty)), (4, 255)].into()
+            );
+        }
         let fake = state.lock().unwrap();
         assert_eq!(
             fake.log
                 .iter()
-                .filter(|op| op.starts_with("write_pwm:"))
+                .filter(|op| op.as_str() == "write_pwm:3:82")
                 .count(),
-            writes_before
+            1
         );
-        assert_eq!(fake.pwm, [(3, 82), (4, 255)].into());
+    }
+
+    #[test]
+    fn heating_bypasses_an_active_hold_or_downward_ramp() {
+        let (mut engine, state) = harness();
+        engine.start(&policy(HostTemperatureSource::Cpu)).unwrap();
+        for (time, temperature, pwm) in [
+            (101, 60_000, 192),
+            (102, 40_000, 192), // hold
+            (103, 65_000, 208), // immediate increase, cancel hold
+            (104, 40_000, 208), // new hold
+            (105, 40_000, 208),
+            (106, 40_000, 208),
+            (107, 40_000, 208),
+            (108, 40_000, 208),
+            (109, 40_000, 208),
+            (110, 40_000, 203), // ramp at 2 percentage points/second
+            (111, 80_000, 255), // immediate full duty during ramp
+        ] {
+            tick_at(
+                &mut engine,
+                &state,
+                Duration::from_secs(time),
+                temperature,
+                45_000,
+            );
+            assert_eq!(state.lock().unwrap().pwm, [(3, pwm), (4, pwm)].into());
+            if matches!(time, 103 | 111) {
+                assert!(
+                    engine
+                        .active
+                        .iter()
+                        .all(|c| c.downward_ramp.lower_since.is_none())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sensor_and_deadline_faults_restore_without_waiting_for_hold_or_ramp() {
+        for fault_during_ramp in [false, true] {
+            for fault in ["cpu", "gpu", "stale", "deadline"] {
+                let (mut engine, state) = harness();
+                engine
+                    .start(&policy(HostTemperatureSource::CpuGpuMax))
+                    .unwrap();
+                tick_at(
+                    &mut engine,
+                    &state,
+                    Duration::from_secs(101),
+                    80_000,
+                    80_000,
+                );
+                let last = if fault_during_ramp { 108 } else { 102 };
+                for time in 102..=last {
+                    tick_at(
+                        &mut engine,
+                        &state,
+                        Duration::from_secs(time),
+                        20_000,
+                        20_000,
+                    );
+                }
+                let now = Duration::from_secs(last + if fault == "deadline" { 3 } else { 1 });
+                let before = state.lock().unwrap().log.len();
+                {
+                    let mut fake = state.lock().unwrap();
+                    fake.now = now;
+                    fake.last_sample = sample(
+                        if fault == "stale" {
+                            now - Duration::from_secs(4)
+                        } else {
+                            now
+                        },
+                        (fault != "cpu").then_some(20_000),
+                        (fault != "gpu").then_some(20_000),
+                    );
+                }
+                assert!(
+                    engine.tick(now).is_err(),
+                    "{fault} during ramp={fault_during_ramp}"
+                );
+                assert_eq!(engine.snapshot().state, HostControlState::Available);
+                let fake = state.lock().unwrap();
+                assert_eq!(fake.enable, [(3, 2), (4, 2)].into());
+                assert_eq!(fake.pwm, [(3, 63), (4, 63)].into());
+                assert!(fake.record.is_none());
+                assert_finalizer_attempted(&fake.log[before..]);
+                assert!(engine.active.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn stop_and_restart_discard_response_memory_and_apply_startup_target() {
+        let (mut engine, state) = harness();
+        let selected = policy(HostTemperatureSource::Cpu);
+        engine.start(&selected).unwrap();
+        tick_at(
+            &mut engine,
+            &state,
+            Duration::from_secs(101),
+            80_000,
+            45_000,
+        );
+        tick_at(&mut engine, &state, Duration::from_secs(102), 0, 45_000);
+        assert_eq!(state.lock().unwrap().pwm, [(3, 255), (4, 255)].into());
+        engine.stop().unwrap();
+        assert_eq!(state.lock().unwrap().pwm, [(3, 63), (4, 63)].into());
+        engine.start(&selected).unwrap();
+        assert!(
+            engine
+                .active
+                .iter()
+                .all(|c| c.downward_ramp == DownwardRamp::default())
+        );
+        tick_at(&mut engine, &state, Duration::from_secs(103), 0, 45_000);
+        assert_eq!(state.lock().unwrap().pwm, [(3, 77), (4, 102)].into());
     }
 
     #[test]
@@ -5455,19 +5700,29 @@ mod tests {
                 assert_eq!(sysfs.read_enable(4).unwrap(), 0);
             }
 
-            let now = Duration::from_secs(103);
-            {
-                let mut fake = state.lock().unwrap();
-                fake.now = now;
-                fake.last_sample = sample(now, Some(40_000), Some(40_000));
+            for seconds in 103..=132 {
+                tick_at(
+                    &mut engine,
+                    &state,
+                    Duration::from_secs(seconds),
+                    40_000,
+                    40_000,
+                );
+                assert_eq!(engine.snapshot().state, HostControlState::Running);
+                // Hold full duty through 108s, then ramp toward the 52.5%
+                // target selected by the existing 2°C cooling hysteresis.
+                let duty = (100_000 - 2_000 * (seconds as i64 - 108).max(0)).max(52_500);
+                let pwm = duty_to_pwm(duty);
+                for channel in [3, 4] {
+                    assert_eq!(sysfs.read_pwm(channel).unwrap(), pwm);
+                    let mode = sysfs.read_enable(channel).unwrap();
+                    assert!(control::manual_observed(channel, mode, pwm));
+                    if pwm < 255 {
+                        assert_eq!(mode, 1);
+                    }
+                }
             }
-            engine.tick(now).unwrap();
-            assert_eq!(engine.snapshot().state, HostControlState::Running);
-            for channel in [3, 4] {
-                // 52.5% after downward temperature hysteresis, rounded up.
-                assert_eq!(sysfs.read_pwm(channel).unwrap(), 134);
-                assert_eq!(sysfs.read_enable(channel).unwrap(), 1);
-            }
+            assert_eq!(state.lock().unwrap().pwm, [(3, 134), (4, 134)].into());
             engine.stop().unwrap();
             let fake = state.lock().unwrap();
             assert_eq!(fake.enable, [(3, 2), (4, 2)].into());
@@ -6680,7 +6935,18 @@ mod tests {
         let changed = changed_policy("front", HostTemperatureSource::Cpu);
         engine.update(std::slice::from_ref(&changed)).unwrap();
         assert_eq!(state.lock().unwrap().pwm, [(3, 255), (4, 255)].into());
-        for (time, temp, front) in [(102, 40_000, 192), (103, 39_000, 192), (104, 37_000, 186)] {
+        for (time, temp, front) in [
+            (102, 40_000, 192),
+            (103, 39_000, 192),
+            (104, 37_000, 192),
+            (105, 37_000, 192),
+            (106, 37_000, 192),
+            (107, 37_000, 192),
+            (108, 37_000, 192),
+            (109, 37_000, 192),
+            (110, 37_000, 187),
+            (111, 37_000, 186),
+        ] {
             let now = Duration::from_secs(time);
             {
                 let mut fake = state.lock().unwrap();
@@ -6694,6 +6960,64 @@ mod tests {
             engine.active[0].duty_millipercent,
             evaluate_curve(&changed.curve, 39_000)
         );
+    }
+
+    #[test]
+    fn live_update_resets_only_selected_ramp_and_preserves_other_groups_rate_clock() {
+        let (mut engine, state) = harness();
+        engine.start(&policy(HostTemperatureSource::Cpu)).unwrap();
+        tick_at(
+            &mut engine,
+            &state,
+            Duration::from_secs(101),
+            80_000,
+            45_000,
+        );
+        tick_at(
+            &mut engine,
+            &state,
+            Duration::from_secs(102),
+            40_000,
+            45_000,
+        );
+        let other_ramp = engine.active[1].downward_ramp;
+        assert_eq!(other_ramp.lower_since, Some(Duration::from_secs(102)));
+        let changed = changed_policy("front", HostTemperatureSource::Cpu);
+        engine.update(std::slice::from_ref(&changed)).unwrap();
+        assert_eq!(engine.active[0].downward_ramp, DownwardRamp::default());
+        assert_eq!(engine.active[1].downward_ramp, other_ramp);
+        assert_eq!(state.lock().unwrap().pwm, [(3, 255), (4, 255)].into());
+        for time in 103..=108 {
+            tick_at(
+                &mut engine,
+                &state,
+                Duration::from_secs(time),
+                40_000,
+                45_000,
+            );
+            assert_eq!(state.lock().unwrap().pwm[&3], 192);
+        }
+        assert_eq!(engine.active[1].duty_millipercent, 98_000);
+        let other_ramp = engine.active[1].downward_ramp;
+        {
+            let mut fake = state.lock().unwrap();
+            fake.now = Duration::from_millis(108_500);
+            fake.last_sample = sample(fake.now, Some(40_000), Some(45_000));
+        }
+        engine.update(std::slice::from_ref(&changed)).unwrap();
+        assert_eq!(engine.last_tick, Some(Duration::from_millis(108_500)));
+        assert_eq!(engine.active[1].downward_ramp, other_ramp);
+        tick_at(
+            &mut engine,
+            &state,
+            Duration::from_secs(109),
+            40_000,
+            45_000,
+        );
+        // A read-only health observation for the other curve must not shorten
+        // the rear group's full second of elapsed ramp time to half a second.
+        assert_eq!(engine.active[1].duty_millipercent, 96_000);
+        assert_eq!(state.lock().unwrap().pwm, [(3, 192), (4, 245)].into());
     }
 
     #[test]
