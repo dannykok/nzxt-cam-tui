@@ -29,11 +29,14 @@ pub const PERSISTENCE_MARGIN_PER_TARGET: Duration = Duration::from_secs(2);
 /// Independent motherboard worker dispatch and persistence allowance.
 pub const HOST_OPERATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(7);
 
-pub const SNAPSHOT_USB_COMMANDS: u32 = 2; // list + status
-pub const APPLY_USB_COMMANDS: u32 = 3; // fresh list + status + write
-pub const DISPLAY_PREFLIGHT_USB_COMMANDS: u32 = 1; // fresh list; upload is asynchronous
+pub const SNAPSHOT_USB_COMMANDS: u32 = 3; // list + status + pending durable worker write
+pub const APPLY_USB_COMMANDS: u32 = 6; // one pending worker tick + fresh list/status/write
+pub const DISPLAY_PREFLIGHT_USB_COMMANDS: u32 = 2; // fresh list + pending durable worker write
 pub const MAX_ACTIVATION_USB_COMMANDS: u32 =
     MAX_MONITORING_FIRMWARE_CURVES as u32 * APPLY_USB_COMMANDS + DISPLAY_PREFLIGHT_USB_COMMANDS;
+pub const MONITORING_SETTING_RESPONSE_TIMEOUT: Duration = SERIAL_USB_COMMAND_BUDGET
+    .saturating_add(PERSISTENCE_MARGIN_PER_TARGET)
+    .saturating_add(RESPONSE_MARGIN);
 
 pub const SNAPSHOT_RESPONSE_TIMEOUT: Duration = SERIAL_USB_COMMAND_BUDGET
     .saturating_mul(SNAPSHOT_USB_COMMANDS)
@@ -63,13 +66,15 @@ pub const ACTIVATION_RESPONSE_TIMEOUT: Duration = SERIAL_USB_COMMAND_BUDGET
 pub const fn response_timeout(request: &Request) -> Duration {
     match request {
         Request::GetSnapshot => SNAPSHOT_RESPONSE_TIMEOUT,
-        Request::ApplyFirmwareCurve { .. } => APPLY_RESPONSE_TIMEOUT,
+        Request::ApplyFirmwareCurve { .. } | Request::ApplyCpuCurve { .. } => {
+            APPLY_RESPONSE_TIMEOUT
+        }
         Request::SetKrakenDisplay { .. } => DISPLAY_RESPONSE_TIMEOUT,
         Request::ActivateMonitoring { .. } => ACTIVATION_RESPONSE_TIMEOUT,
         Request::StartHostControl { .. }
         | Request::UpdateHostControl { .. }
-        | Request::StopHostControl
-        | Request::SetMonitoringAutoResume { .. } => HOST_OPERATION_RESPONSE_TIMEOUT,
+        | Request::StopHostControl => HOST_OPERATION_RESPONSE_TIMEOUT,
+        Request::SetMonitoringAutoResume { .. } => MONITORING_SETTING_RESPONSE_TIMEOUT,
     }
 }
 
@@ -90,10 +95,13 @@ mod tests {
         assert!(APPLY_RESPONSE_TIMEOUT > command * 3 + PERSISTENCE_MARGIN_PER_TARGET);
         assert!(DISPLAY_RESPONSE_TIMEOUT > command + PERSISTENCE_MARGIN_PER_TARGET);
         assert_eq!(MAX_MONITORING_FIRMWARE_CURVES, 32);
-        assert_eq!(MAX_ACTIVATION_USB_COMMANDS, 32 * 3 + 1);
+        assert_eq!(
+            MAX_ACTIVATION_USB_COMMANDS,
+            32 * APPLY_USB_COMMANDS + DISPLAY_PREFLIGHT_USB_COMMANDS
+        );
         assert!(
             ACTIVATION_RESPONSE_TIMEOUT
-                > command * (32 * 3 + 1)
+                > command * MAX_ACTIVATION_USB_COMMANDS
                     + PERSISTENCE_MARGIN_PER_TARGET * 33
                     + HOST_OPERATION_RESPONSE_TIMEOUT
         );
@@ -111,6 +119,14 @@ mod tests {
                 Request::ApplyFirmwareCurve {
                     device_id: DeviceId::new("aio"),
                     channel_id: ChannelId::new("pump"),
+                    points: Vec::new(),
+                },
+                APPLY_RESPONSE_TIMEOUT,
+            ),
+            (
+                Request::ApplyCpuCurve {
+                    device_id: DeviceId::new("aio"),
+                    channel_id: ChannelId::new("fan"),
                     points: Vec::new(),
                 },
                 APPLY_RESPONSE_TIMEOUT,
@@ -147,7 +163,7 @@ mod tests {
             (Request::StopHostControl, HOST_OPERATION_RESPONSE_TIMEOUT),
             (
                 Request::SetMonitoringAutoResume { enabled: true },
-                HOST_OPERATION_RESPONSE_TIMEOUT,
+                MONITORING_SETTING_RESPONSE_TIMEOUT,
             ),
         ];
         for (request, expected) in cases {

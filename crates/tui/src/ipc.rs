@@ -21,7 +21,7 @@ mod linux {
     use futures_util::{SinkExt, StreamExt};
     use nzxt_cam_protocol::{
         ClientHello, ErrorCode, FrameError, JsonFrameCodec, MonitoringActivationOutcome,
-        MonitoringDisplaySelection, MonitoringFirmwareCurve, PROTOCOL_VERSION_V6, RejectionCode,
+        MonitoringDisplaySelection, MonitoringFirmwareCurve, PROTOCOL_VERSION_V7, RejectionCode,
         Request, Response, ServerResponse, from_value,
         time_budget::{CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, SEND_TIMEOUT, response_timeout},
     };
@@ -354,6 +354,41 @@ mod linux {
             }
         }
 
+        fn apply_cpu_curve(
+            &mut self,
+            device_id: &DeviceId,
+            channel_id: &ChannelId,
+            points: &[CurvePoint],
+        ) -> Result<(), BackendError> {
+            if self.connection.is_none() {
+                self.connect()?;
+            }
+            match self.exchange(Request::ApplyCpuCurve {
+                device_id: device_id.clone(),
+                channel_id: channel_id.clone(),
+                points: points.to_vec(),
+            }) {
+                Ok(Response::FirmwareCurveApplied) => Ok(()),
+                Ok(Response::Error { code, message }) => {
+                    Err(apply_service_error(code, message.as_str()))
+                }
+                Ok(_) => {
+                    self.discard_connection();
+                    Err(unknown_apply_outcome("unexpected CPU curve response")
+                        .invalidating_live_curve_claims())
+                }
+                Err(failure) => {
+                    self.discard_connection();
+                    Err(if failure.send_started {
+                        unknown_apply_outcome(&failure.message)
+                    } else {
+                        pre_dispatch_apply_error(failure)
+                    }
+                    .invalidating_live_curve_claims())
+                }
+            }
+        }
+
         fn start_host_control(&mut self, policy: &HostControlPolicy) -> Result<(), BackendError> {
             if self.connection.is_none() {
                 self.connect()?;
@@ -524,7 +559,7 @@ mod linux {
         let handshake = async {
             let (mut sender, mut receiver) = connection.split();
             let (send_result, response_result) =
-                tokio::join!(sender.send(ClientHello::v6()), async {
+                tokio::join!(sender.send(ClientHello::v7()), async {
                     let value = receiver.next().await.ok_or_else(|| {
                         FrameError::Io(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
@@ -554,7 +589,7 @@ mod linux {
                 )),
                 ServerResponse::Ready { protocol_version } => {
                     send_result.map_err(|error| handshake_data_error(path, error))?;
-                    if protocol_version != PROTOCOL_VERSION_V6 {
+                    if protocol_version != PROTOCOL_VERSION_V7 {
                         return Err(BackendError::with_kind(
                             BackendErrorKind::InvalidData,
                             format!(
@@ -992,8 +1027,8 @@ mod linux {
         }
 
         fn ready(stream: &mut StdUnixStream) {
-            assert_eq!(read_frame::<ClientHello>(stream), ClientHello::v6());
-            write_frame(stream, &ServerResponse::ready_v6());
+            assert_eq!(read_frame::<ClientHello>(stream), ClientHello::v7());
+            write_frame(stream, &ServerResponse::ready_v7());
         }
 
         fn spawn_peer(
@@ -1149,9 +1184,10 @@ mod linux {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn maximum_activation_covers_all_97_commands_persistence_and_host_work() {
+        async fn maximum_activation_covers_all_worker_and_usb_commands_persistence_and_host_work() {
             let curves: Vec<_> = (0..MAX_MONITORING_FIRMWARE_CURVES)
                 .map(|n| MonitoringFirmwareCurve {
+                    source: nzxt_cam_core::TemperatureSource::Liquid,
                     device_id: DeviceId::new(format!("kraken-{n}")),
                     channel_id: ChannelId::new("pump"),
                     points: (20..60)
@@ -1340,11 +1376,12 @@ mod linux {
         }
 
         #[test]
-        fn activation_and_future_resume_use_v6_wire_without_retrying_lost_acks() {
+        fn activation_and_future_resume_use_v7_wire_without_retrying_lost_acks() {
             use nzxt_cam_protocol::{
                 MonitoringActivationOutcome, MonitoringActivationStatus, MonitoringActivationTarget,
             };
             let curves = vec![MonitoringFirmwareCurve {
+                source: nzxt_cam_core::TemperatureSource::Liquid,
                 device_id: DeviceId::new("kraken"),
                 channel_id: ChannelId::new("pump"),
                 points: (20..60)
@@ -1985,6 +2022,48 @@ mod linux {
             assert!(error.invalidates_live_curve_claims());
             assert!(backend.connection.is_none());
             peer.join().unwrap();
+        }
+
+        #[test]
+        fn cpu_curve_is_sent_once_and_lost_ack_is_unknown() {
+            for success in [true, false] {
+                let (socket, peer) = spawn_peer(move |listener| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    ready(&mut stream);
+                    let Request::ApplyCpuCurve {
+                        device_id,
+                        channel_id,
+                        points,
+                    } = read_frame::<Request>(&mut stream)
+                    else {
+                        panic!("expected CPU curve");
+                    };
+                    assert_eq!(device_id, DeviceId::new("kraken"));
+                    assert_eq!(channel_id, ChannelId::new("pump"));
+                    assert_eq!(points[39].temperature, 100);
+                    if success {
+                        write_frame(&mut stream, &Response::FirmwareCurveApplied);
+                    }
+                });
+                let mut backend = IpcBackend::connect_to(&socket.path).unwrap();
+                let points =
+                    crate::profile::built_in_kraken_profiles(nzxt_cam_core::TemperatureSource::Cpu)
+                        [1]
+                    .points
+                    .clone();
+                let result = backend.apply_cpu_curve(
+                    &DeviceId::new("kraken"),
+                    &ChannelId::new("pump"),
+                    &points,
+                );
+                if success {
+                    result.unwrap();
+                } else {
+                    assert!(result.unwrap_err().write_outcome_unknown());
+                }
+                drop(backend);
+                peer.join().unwrap();
+            }
         }
 
         #[test]

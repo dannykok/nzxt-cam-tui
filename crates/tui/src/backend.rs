@@ -56,6 +56,17 @@ pub trait HardwareBackend: Send + 'static {
         channel_id: &ChannelId,
         points: &[CurvePoint],
     ) -> Result<(), BackendError>;
+    fn apply_cpu_curve(
+        &mut self,
+        _device_id: &DeviceId,
+        _channel_id: &ChannelId,
+        _points: &[CurvePoint],
+    ) -> Result<(), BackendError> {
+        Err(BackendError::with_kind(
+            BackendErrorKind::Unsupported,
+            "CPU-based Kraken cooling unsupported",
+        ))
+    }
     fn start_host_control(&mut self, _policy: &HostControlPolicy) -> Result<(), BackendError> {
         Err(BackendError::with_kind(
             BackendErrorKind::Unsupported,
@@ -391,6 +402,28 @@ impl HardwareBackend for DemoBackend {
             .ok_or_else(|| BackendError::new("selected cooling channel is no longer available"))?;
 
         channel.points = points.to_vec();
+        channel.source = TemperatureSource::Liquid;
+        Ok(())
+    }
+
+    fn apply_cpu_curve(
+        &mut self,
+        device_id: &DeviceId,
+        channel_id: &ChannelId,
+        points: &[CurvePoint],
+    ) -> Result<(), BackendError> {
+        self.apply_curve(device_id, channel_id, points)?;
+        let channel = self
+            .snapshot
+            .devices
+            .iter_mut()
+            .find(|d| &d.id == device_id)
+            .unwrap()
+            .cooling_channels
+            .iter_mut()
+            .find(|c| &c.id == channel_id)
+            .unwrap();
+        channel.source = TemperatureSource::Cpu;
         Ok(())
     }
 

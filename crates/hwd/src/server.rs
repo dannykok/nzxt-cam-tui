@@ -85,7 +85,7 @@ impl std::error::Error for ServiceError {}
 /// Serves an already-bound listener using one shared hardware manager until
 /// `shutdown` resolves.
 ///
-/// There is exactly one active connection. A successful v6 client may issue
+/// There is exactly one active connection. A successful v7 client may issue
 /// sequential operations over that connection. During guarded startup, the
 /// handshake is prompt but hardware requests return `Unavailable` (initializing).
 /// A second accepted connection is rejected without reading its bytes. Shutdown is
@@ -252,7 +252,7 @@ async fn handle_active_connection<H>(
     let ready_sent = tokio::select! {
         biased;
         _ = wait_for_shutdown(&mut shutdown) => false,
-        result = framed.send(ServerResponse::ready_v6()) => result.is_ok(),
+        result = framed.send(ServerResponse::ready_v7()) => result.is_ok(),
     };
     if !ready_sent {
         return;
@@ -369,6 +369,13 @@ where
             Request::GetSnapshot => hardware
                 .snapshot()
                 .map(|snapshot| Response::Snapshot { snapshot }),
+            Request::ApplyCpuCurve {
+                device_id,
+                channel_id,
+                points,
+            } => hardware
+                .apply_cpu_curve(&device_id, &channel_id, &points)
+                .map(|()| Response::FirmwareCurveApplied),
             Request::ApplyFirmwareCurve {
                 device_id,
                 channel_id,
@@ -982,6 +989,7 @@ mod tests {
             id: &DeviceId,
             _: &ChannelId,
             _: &[CurvePoint],
+            _: nzxt_cam_core::TemperatureSource,
         ) -> Result<Preflight, HardwareError> {
             self.control
                 .observed
@@ -997,6 +1005,7 @@ mod tests {
             id: &DeviceId,
             channel: &ChannelId,
             points: &[CurvePoint],
+            _: nzxt_cam_core::TemperatureSource,
         ) -> Result<(), HardwareError> {
             self.apply_firmware_curve(id, channel, points)
         }
@@ -1271,10 +1280,10 @@ mod tests {
 
     async fn connect_ready(path: &Path) -> Framed<UnixStream, JsonFrameCodec> {
         let mut client = connect(path).await;
-        client.send(ClientHello::v6()).await.unwrap();
+        client.send(ClientHello::v7()).await.unwrap();
         assert_eq!(
             receive::<ServerResponse>(&mut client).await,
-            ServerResponse::ready_v6()
+            ServerResponse::ready_v7()
         );
         client
     }
@@ -1283,9 +1292,9 @@ mod tests {
         time::timeout(Duration::from_secs(1), async {
             loop {
                 let mut candidate = connect(path).await;
-                candidate.send(ClientHello::v6()).await.unwrap();
+                candidate.send(ClientHello::v7()).await.unwrap();
                 match receive::<ServerResponse>(&mut candidate).await {
-                    response if response == ServerResponse::ready_v6() => return candidate,
+                    response if response == ServerResponse::ready_v7() => return candidate,
                     ServerResponse::Rejected {
                         code: RejectionCode::ServiceBusy,
                     } => yield_now().await,
@@ -1402,6 +1411,7 @@ mod tests {
             }
         ));
         let curve = MonitoringFirmwareCurve {
+            source: nzxt_cam_core::TemperatureSource::Liquid,
             device_id: DeviceId::new("aio"),
             channel_id: ChannelId::new("pump"),
             points: (20..60)
@@ -1541,6 +1551,32 @@ mod tests {
         assert_eq!(observed.snapshot_calls, 2);
         assert_eq!(observed.disconnects, 0);
 
+        drop(client);
+        stop_service(shutdown, service).await;
+    }
+
+    #[tokio::test]
+    async fn cpu_requests_never_fall_through_to_a_liquid_only_adapter() {
+        let (path, listener) = SocketPath::bind();
+        let (hardware, control) = FakeHardware::new();
+        let (shutdown, service) = start_service(listener, hardware).await;
+        let mut client = connect_ready(path.as_path()).await;
+        client
+            .send(Request::ApplyCpuCurve {
+                device_id: DeviceId::new("kraken"),
+                channel_id: ChannelId::new("pump"),
+                points: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            receive::<Response>(&mut client).await,
+            Response::Error {
+                code: ErrorCode::Unsupported,
+                ..
+            }
+        ));
+        assert!(control.snapshot().apply_calls.is_empty());
         drop(client);
         stop_service(shutdown, service).await;
     }
@@ -2537,7 +2573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixed_v6_ready_handshake_keeps_connection_open() {
+    async fn fixed_v7_ready_handshake_keeps_connection_open() {
         let (client, service) = UnixStream::pair().unwrap();
         let (hardware, control) = FakeHardware::new();
         let cancellation = hardware.cancellation_handle();
@@ -2553,10 +2589,10 @@ mod tests {
         ));
         let mut client = Framed::new(client, JsonFrameCodec::new());
 
-        client.send(ClientHello::v6()).await.unwrap();
+        client.send(ClientHello::v7()).await.unwrap();
         assert_eq!(
             receive::<ServerResponse>(&mut client).await,
-            ServerResponse::ready_v6()
+            ServerResponse::ready_v7()
         );
         assert!(
             time::timeout(Duration::from_millis(25), client.next())
@@ -2700,10 +2736,10 @@ mod tests {
         ));
         let mut client = Framed::new(client, JsonFrameCodec::new());
 
-        client.send(ClientHello::v6()).await.unwrap();
+        client.send(ClientHello::v7()).await.unwrap();
         assert_eq!(
             receive::<ServerResponse>(&mut client).await,
-            ServerResponse::ready_v6()
+            ServerResponse::ready_v7()
         );
         drop(client);
 
@@ -2944,6 +2980,7 @@ mod tests {
         let store_path = root.path().join("monitor-intent.json");
         let mut store = FileMonitorIntentStore::at(store_path.clone());
         let curve = |id| MonitorTarget::AioCurve {
+            source: nzxt_cam_core::TemperatureSource::Liquid,
             device_id: DeviceId::new(id),
             channel_id: ChannelId::new("pump"),
             points: vec![CurvePoint {

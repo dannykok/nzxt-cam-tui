@@ -13,6 +13,7 @@ pub mod hardware;
 pub mod host_control;
 pub mod it8689;
 mod it8689_control;
+mod kraken_cooling;
 mod kraken_display;
 pub mod liquidctl;
 pub mod monitor_intent;

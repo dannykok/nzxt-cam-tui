@@ -7,11 +7,11 @@ A keyboard-first Linux hardware monitor and cooling-curve TUI editor for NZXT an
 ## Features
 
 - AIO, fan, USB and optional host telemetry, grouped in a compact dashboard.
-- Editable 40-point pump/fan firmware curves for supported Kraken Z3/X3 devices, plus built-in and saved custom profiles. Edits do not write hardware until applied; later firmware applies require confirmation by default.
+- Editable 40-point Kraken pump/fan curves with per-channel Liquid/CPU temperature sources, plus built-in and saved custom profiles. **S** switches the source; **Enter** applies. Liquid curves run in firmware; CPU curves run in the service with autonomous liquid-temperature protection, and return to liquid control on sensor loss or clean service shutdown. Edits do not write hardware until applied; later applies require confirmation by default.
 - Kraken 2023 LCD face picker with CPU, GPU, liquid and combined temperature presets. The service maintains the selected face after the TUI exits.
 - Motherboard fan-policy view with CPU/GPU/MAX temperature sources and per-group curves. Motherboard control is **disabled by default**; the packaged example keeps its channel configuration commented out because safe startup and minimum duties have not been established. Do not enable it without a separate safety assessment.
 
-During service startup, the TUI connects but hardware requests remain unavailable until recovery and saved-setting replay finish. Before the service has a saved opt-in, the overview is read-only. **Enter** opts in: it can write available AIO curves and start any available motherboard fan control, with separate results for each component. **O** opens Settings for future auto-resume and immediate motherboard Stop. Quitting the TUI does **not** stop service-owned control or LCD updates. The curve editor needs a terminal of at least 88×30.
+During service startup, the TUI connects but hardware requests remain unavailable until recovery and saved-setting replay finish. Before the service has a saved opt-in, the overview is read-only. **Enter** opts in: it can write available AIO curves and start any available motherboard fan control, with separate results for each component. **O** opens Settings for future auto-resume and immediate motherboard Stop. Quitting the TUI does **not** stop service-owned control or LCD updates. CPU-based Kraken cooling requires the existing `k10temp`/`Tctl` sensor; it forces 100% duty at 95°C and needs an explicit reapply after a sensor fault. The curve editor needs a terminal of at least 88×30.
 
 To try the interface without a service or hardware, run `cargo run -- --demo` from the repository root.
 
@@ -57,7 +57,7 @@ Reboot and repeat the identity check **before** using motherboard control. The s
 
 ## Installation
 
-**Install the service and TUI from the same build:** they use a fixed v6 protocol, so upgrading only the TUI can leave it unable to connect.
+**Install the service and TUI from the same build:** they use a fixed v7 protocol, so upgrading only the TUI can leave it unable to connect.
 
 ### Existing systemd installation
 

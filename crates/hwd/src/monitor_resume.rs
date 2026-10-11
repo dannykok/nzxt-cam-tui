@@ -5,11 +5,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nzxt_cam_core::{ChannelId, CurvePoint, DeviceId, KrakenDisplayMode};
+use nzxt_cam_core::{ChannelId, CurvePoint, DeviceId, KrakenDisplayMode, TemperatureSource};
 
 use crate::{
     hardware::{HardwareCancellation, HardwareError},
-    liquidctl::LiquidctlHardware,
+    kraken_cooling::KrakenCoolingWorker,
     monitor_intent::{FileMonitorIntentStore, MonitorTarget, SavedMonitorIntent, WriteState},
 };
 
@@ -43,23 +43,26 @@ pub(crate) trait ResumeHardware {
         device_id: &DeviceId,
         channel_id: &ChannelId,
         points: &[CurvePoint],
+        source: TemperatureSource,
     ) -> Result<Preflight, HardwareError>;
     fn write_curve(
         &mut self,
         device_id: &DeviceId,
         channel_id: &ChannelId,
         points: &[CurvePoint],
+        source: TemperatureSource,
     ) -> Result<(), HardwareError>;
 }
 
-impl ResumeHardware for LiquidctlHardware {
+impl ResumeHardware for KrakenCoolingWorker {
     fn preflight(
         &mut self,
         device_id: &DeviceId,
         channel_id: &ChannelId,
         points: &[CurvePoint],
+        source: TemperatureSource,
     ) -> Result<Preflight, HardwareError> {
-        match self.preflight_resume_curve(device_id, channel_id, points)? {
+        match KrakenCoolingWorker::preflight(self, device_id, channel_id, source, points)? {
             true => Ok(Preflight::Ready),
             false => Ok(Preflight::Offline),
         }
@@ -69,9 +72,9 @@ impl ResumeHardware for LiquidctlHardware {
         device_id: &DeviceId,
         channel_id: &ChannelId,
         points: &[CurvePoint],
+        source: TemperatureSource,
     ) -> Result<(), HardwareError> {
-        use crate::hardware::HardwareOperations;
-        self.apply_firmware_curve(device_id, channel_id, points)
+        self.apply(device_id, channel_id, source, points)
     }
 }
 
@@ -126,11 +129,12 @@ pub(crate) fn boot<S: IntentStore, H: ResumeHardware>(
                 device_id,
                 channel_id,
                 points,
+                source,
             } => {
                 let mut ready = false;
                 for attempt in 0..3 {
                     check()?;
-                    match hardware.preflight(device_id, channel_id, points) {
+                    match hardware.preflight(device_id, channel_id, points, *source) {
                         Ok(Preflight::Ready) => {
                             ready = true;
                             break;
@@ -152,7 +156,7 @@ pub(crate) fn boot<S: IntentStore, H: ResumeHardware>(
                 check()?;
                 store.mark_in_flight(&saved.target)?;
                 check()?;
-                match hardware.write_curve(device_id, channel_id, points) {
+                match hardware.write_curve(device_id, channel_id, points, *source) {
                     Ok(()) => {
                         // A definite success must be persisted even if shutdown
                         // arrived during the write. Never retry an uncertain write.
@@ -194,6 +198,7 @@ mod tests {
 
     fn curve(id: &str) -> MonitorTarget {
         MonitorTarget::AioCurve {
+            source: TemperatureSource::Liquid,
             device_id: DeviceId::new(id),
             channel_id: ChannelId::new("pump"),
             points: (20..60)
@@ -272,6 +277,7 @@ mod tests {
         fail: Vec<String>,
         cancel_preflight: Option<HardwareCancellation>,
         cancel_write: Option<HardwareCancellation>,
+        sources: Vec<TemperatureSource>,
         log: Rc<RefCell<Vec<String>>>,
     }
     impl ResumeHardware for FakeHardware {
@@ -280,7 +286,9 @@ mod tests {
             id: &DeviceId,
             _: &ChannelId,
             points: &[CurvePoint],
+            source: TemperatureSource,
         ) -> Result<Preflight, HardwareError> {
+            self.sources.push(source);
             self.log.borrow_mut().push(format!("preflight:{id}"));
             assert_eq!(points.len(), 40);
             if let Some(cancellation) = &self.cancel_preflight {
@@ -297,7 +305,9 @@ mod tests {
             id: &DeviceId,
             _: &ChannelId,
             _: &[CurvePoint],
+            source: TemperatureSource,
         ) -> Result<(), HardwareError> {
+            self.sources.push(source);
             self.log.borrow_mut().push(format!("write:{id}"));
             if let Some(cancellation) = &self.cancel_write {
                 cancellation.cancel();
@@ -352,6 +362,42 @@ mod tests {
         store.fail_load = true;
         assert!(run(&mut store, &mut hw).is_err());
         assert_eq!(hw.log.borrow().last().unwrap(), "host:false");
+    }
+
+    #[test]
+    fn cpu_intent_replay_preserves_source_and_only_replays_ready_authorized_targets() {
+        let mut selected = curve("aio");
+        if let MonitorTarget::AioCurve { source, points, .. } = &mut selected {
+            *source = TemperatureSource::Cpu;
+            for (index, point) in points.iter_mut().enumerate() {
+                point.temperature = 22 + 2 * index as u8;
+            }
+        }
+        let mut store = FakeStore {
+            intent: Some(saved(vec![(selected.clone(), WriteState::Ready)], true)),
+            ..Default::default()
+        };
+        let mut hw = FakeHardware {
+            online: vec!["aio".into()],
+            ..Default::default()
+        };
+        let (selection, _) = run(&mut store, &mut hw).unwrap();
+        assert_eq!(selection.applied_curves, vec![selected.clone()]);
+        assert_eq!(hw.sources, [TemperatureSource::Cpu, TemperatureSource::Cpu]);
+        assert_eq!(
+            store.intent.as_ref().unwrap().targets[0].state,
+            WriteState::Ready
+        );
+        store.intent = Some(saved(vec![(selected, WriteState::InFlightUnknown)], true));
+        hw.sources.clear();
+        assert!(
+            run(&mut store, &mut hw)
+                .unwrap()
+                .0
+                .applied_curves
+                .is_empty()
+        );
+        assert!(hw.sources.is_empty());
     }
 
     #[test]

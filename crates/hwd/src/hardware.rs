@@ -15,12 +15,13 @@ use nzxt_cam_core::{
     ChannelId, CurvePoint, Device, DeviceId, HardwareSnapshot, HostChannelPolicy,
     HostControlPolicy, HostControlSnapshot, HostControlState, KrakenDisplayMode,
     KrakenDisplaySnapshot, MonitoringActualState, MonitoringError, MonitoringSnapshot,
-    MonitoringTargetIntent, MonitoringTargetSnapshot,
+    MonitoringTargetIntent, MonitoringTargetSnapshot, TemperatureSource,
 };
 
 use crate::{
     config::{ConfigError, HardwareConfig},
     host_control::{HostControlEngine, HostControlShutdownHandle, HostControlWorker},
+    kraken_cooling::{IntentStore, KrakenCoolingWorker},
     kraken_display::KrakenDisplayWorker,
     liquidctl::LiquidctlHardware,
     monitor_intent::{FileMonitorIntentStore, MonitorTarget, WriteState},
@@ -200,6 +201,18 @@ pub trait HardwareOperations: Send + 'static {
         points: &[CurvePoint],
     ) -> Result<(), HardwareError>;
 
+    fn apply_cpu_curve(
+        &mut self,
+        _device_id: &DeviceId,
+        _channel_id: &ChannelId,
+        _points: &[CurvePoint],
+    ) -> Result<(), HardwareError> {
+        Err(HardwareError::with_kind(
+            HardwareErrorKind::Unsupported,
+            "CPU-based Kraken cooling unsupported",
+        ))
+    }
+
     fn start_host_control(&mut self, policy: &HostControlPolicy) -> Result<(), HardwareError>;
 
     fn update_host_control(
@@ -221,7 +234,8 @@ pub struct HardwareManager {
     telemetry: HostTelemetry,
     host_control: HostControlWorker,
     kraken_display: KrakenDisplayWorker,
-    monitor_store: FileMonitorIntentStore,
+    monitor_store: IntentStore,
+    kraken_cooling: KrakenCoolingWorker,
     monitor_actual: Vec<(
         MonitorTarget,
         MonitoringActualState,
@@ -299,12 +313,14 @@ impl HardwareManager {
 
     fn from_config(config: HardwareConfig, host_control_lock: Option<HostControlLock>) -> Self {
         let io_lock = Arc::new(std::sync::Mutex::new(()));
+        let monitor_store = Arc::new(std::sync::Mutex::new(FileMonitorIntentStore::new()));
         Self {
             hardware: LiquidctlHardware::with_io_lock(io_lock.clone()),
             telemetry: HostTelemetry::new(config.clone()),
             host_control: HostControlWorker::new(HostControlEngine::new(config.clone())),
-            kraken_display: KrakenDisplayWorker::new(config, io_lock),
-            monitor_store: FileMonitorIntentStore::new(),
+            kraken_display: KrakenDisplayWorker::new(config.clone(), io_lock.clone()),
+            kraken_cooling: KrakenCoolingWorker::new(config, io_lock, monitor_store.clone()),
+            monitor_store,
             monitor_actual: Vec::new(),
             #[cfg(test)]
             host_start_dispatch_gate: None,
@@ -320,6 +336,9 @@ impl HardwareManager {
         host_start_dispatch_gate: Arc<HostStartDispatchGate>,
     ) -> Self {
         let root = tempfile::TempDir::new().unwrap();
+        let monitor_store = Arc::new(std::sync::Mutex::new(FileMonitorIntentStore::at(
+            root.path().join("monitor-intent.json"),
+        )));
         Self {
             hardware: LiquidctlHardware::unavailable_for_test(),
             telemetry: HostTelemetry::at_empty_test_root(root.path()),
@@ -328,20 +347,58 @@ impl HardwareManager {
                 LiquidctlHardware::unavailable_for_test(),
                 HostTelemetry::at_empty_test_root(root.path()),
             ),
-            monitor_store: FileMonitorIntentStore::at(root.path().join("monitor-intent.json")),
+            kraken_cooling: KrakenCoolingWorker::with_sources(
+                LiquidctlHardware::unavailable_for_test(),
+                HostTelemetry::at_empty_test_root(root.path()),
+                monitor_store.clone(),
+            ),
+            monitor_store,
             monitor_actual: Vec::new(),
             host_start_dispatch_gate: Some(host_start_dispatch_gate),
             _test_telemetry_root: Some(root),
             _host_control_lock: None,
         }
     }
+    fn apply_kraken_curve(
+        &mut self,
+        device_id: &DeviceId,
+        channel_id: &ChannelId,
+        points: &[CurvePoint],
+        source: TemperatureSource,
+    ) -> Result<(), HardwareError> {
+        if !self
+            .kraken_cooling
+            .preflight(device_id, channel_id, source, points)?
+        {
+            return Err(HardwareError::with_kind(
+                HardwareErrorKind::Unavailable,
+                "cooler offline",
+            ));
+        }
+        let target = MonitorTarget::AioCurve {
+            source,
+            device_id: device_id.clone(),
+            channel_id: channel_id.clone(),
+            points: points.to_vec(),
+        };
+        let mut store = self.monitor_store.lock().unwrap();
+        monitor_service::update_selected(&mut *store, target.clone())?;
+        let result =
+            monitor_service::write_curve(&mut *store, &target, |id, channel, points, source| {
+                self.kraken_cooling.apply(id, channel, source, points)
+            });
+        monitor_service::record_write(&mut self.monitor_actual, &target, &result);
+        result
+    }
+
     fn monitoring_snapshot(
         &self,
         snapshot: &HardwareSnapshot,
     ) -> Result<MonitoringSnapshot, HardwareError> {
-        let Some(intent) = self.monitor_store.load()? else {
+        let Some(intent) = self.monitor_store.lock().unwrap().load()? else {
             return Ok(MonitoringSnapshot::default());
         };
+        let cooling = self.kraken_cooling.selections();
         let targets = intent
             .targets
             .into_iter()
@@ -391,13 +448,37 @@ impl HardwareManager {
                 {
                     actual_state = MonitoringActualState::Unavailable;
                 }
+                if let MonitorTarget::AioCurve {
+                    device_id,
+                    channel_id,
+                    ..
+                } = &saved.target
+                    && saved.state == WriteState::Ready
+                    && let Some(selection) = cooling.get(&(device_id.clone(), channel_id.clone()))
+                {
+                    if actual_state != MonitoringActualState::Unavailable
+                        || selection.state != MonitoringActualState::Applied
+                    {
+                        actual_state = selection.state;
+                        last_error = selection.error.as_ref().map(MonitoringError::new);
+                    }
+                    if !snapshot
+                        .devices
+                        .iter()
+                        .any(|d| d.online && &d.id == device_id)
+                    {
+                        actual_state = MonitoringActualState::Unavailable;
+                    }
+                }
                 MonitoringTargetSnapshot {
                     intent: match saved.target {
                         MonitorTarget::AioCurve {
                             device_id,
                             channel_id,
                             points,
+                            source,
                         } => MonitoringTargetIntent::AioCurve {
+                            source,
                             device_id,
                             channel_id,
                             points,
@@ -499,7 +580,8 @@ fn append_service_state(
 }
 
 struct ManagerMonitoringIo<'a> {
-    hardware: &'a mut LiquidctlHardware,
+    hardware: &'a KrakenCoolingWorker,
+    usb: &'a mut LiquidctlHardware,
     host: &'a mut HostControlWorker,
     display: &'a KrakenDisplayWorker,
 }
@@ -510,19 +592,21 @@ impl MonitoringIo for ManagerMonitoringIo<'_> {
         id: &DeviceId,
         channel: &ChannelId,
         points: &[CurvePoint],
+        source: TemperatureSource,
     ) -> Result<bool, HardwareError> {
-        self.hardware.preflight_resume_curve(id, channel, points)
+        self.hardware.preflight(id, channel, source, points)
     }
     fn write_curve(
         &mut self,
         id: &DeviceId,
         channel: &ChannelId,
         points: &[CurvePoint],
+        source: TemperatureSource,
     ) -> Result<(), HardwareError> {
-        self.hardware.apply_firmware_curve(id, channel, points)
+        self.hardware.apply(id, channel, source, points)
     }
     fn preflight_display(&mut self, id: &DeviceId) -> Result<(), HardwareError> {
-        self.hardware.display_serial(id).map(|_| ())
+        self.usb.display_serial(id).map(|_| ())
     }
     fn select_display(&mut self, id: DeviceId, mode: KrakenDisplayMode) {
         self.display.select(id, mode);
@@ -552,8 +636,8 @@ impl HardwareOperations for HardwareManager {
             }
         };
         let selection = monitor_resume::boot(
-            &mut self.monitor_store,
-            &mut self.hardware,
+            &mut *self.monitor_store.lock().unwrap(),
+            &mut self.kraken_cooling,
             |resume| self.host_control.initialize_with_resume(resume),
             || monitor_resume::startup_pause(&cancellation),
             check,
@@ -579,6 +663,21 @@ impl HardwareOperations for HardwareManager {
                 self.hardware.offline_snapshot()
             }
         };
+        for ((id, channel_id), selection) in self.kraken_cooling.selections() {
+            if let Some(channel) = snapshot
+                .devices
+                .iter_mut()
+                .filter(|d| d.online && d.id == id)
+                .flat_map(|d| &mut d.cooling_channels)
+                .find(|c| c.id == channel_id)
+            {
+                *channel = selection.channel;
+                if self.monitor_actual.iter().any(|(target, state, _)| {
+                    matches!(target, MonitorTarget::AioCurve { device_id, channel_id: saved, .. } if device_id == &id && saved == &channel_id)
+                        && *state == MonitoringActualState::Unavailable
+                }) { channel.curve_state = nzxt_cam_core::CurveState::Unverified; }
+            }
+        }
         let host = self.telemetry.sample_device();
         append_service_state(&mut snapshot, host, self.host_control.snapshot());
         let display = self.kraken_display.snapshot();
@@ -606,7 +705,7 @@ impl HardwareOperations for HardwareManager {
             device_id: device_id.clone(),
             mode,
         };
-        monitor_service::update_selected(&mut self.monitor_store, target.clone())?;
+        monitor_service::update_selected(&mut *self.monitor_store.lock().unwrap(), target.clone())?;
         self.monitor_actual
             .retain(|(saved, _, _)| !monitor_service::same_key(saved, &target));
         self.kraken_display.select(device_id.clone(), mode);
@@ -619,28 +718,16 @@ impl HardwareOperations for HardwareManager {
         channel_id: &ChannelId,
         points: &[CurvePoint],
     ) -> Result<(), HardwareError> {
-        if !self
-            .hardware
-            .preflight_resume_curve(device_id, channel_id, points)?
-        {
-            return Err(HardwareError::with_kind(
-                HardwareErrorKind::Unavailable,
-                "cooler offline",
-            ));
-        }
-        let target = MonitorTarget::AioCurve {
-            device_id: device_id.clone(),
-            channel_id: channel_id.clone(),
-            points: points.to_vec(),
-        };
-        monitor_service::update_selected(&mut self.monitor_store, target.clone())?;
-        let result = monitor_service::write_curve(
-            &mut self.monitor_store,
-            &target,
-            |id, channel, points| self.hardware.apply_firmware_curve(id, channel, points),
-        );
-        monitor_service::record_write(&mut self.monitor_actual, &target, &result);
-        result
+        self.apply_kraken_curve(device_id, channel_id, points, TemperatureSource::Liquid)
+    }
+
+    fn apply_cpu_curve(
+        &mut self,
+        device_id: &DeviceId,
+        channel_id: &ChannelId,
+        points: &[CurvePoint],
+    ) -> Result<(), HardwareError> {
+        self.apply_kraken_curve(device_id, channel_id, points, TemperatureSource::Cpu)
     }
 
     fn activate_monitoring(
@@ -650,12 +737,13 @@ impl HardwareOperations for HardwareManager {
         display: Option<&MonitoringDisplaySelection>,
     ) -> Result<Vec<MonitoringActivationOutcome>, HardwareError> {
         let mut io = ManagerMonitoringIo {
-            hardware: &mut self.hardware,
+            hardware: &self.kraken_cooling,
+            usb: &mut self.hardware,
             host: &mut self.host_control,
             display: &self.kraken_display,
         };
         monitor_service::activate(
-            &mut self.monitor_store,
+            &mut *self.monitor_store.lock().unwrap(),
             &mut io,
             &mut self.monitor_actual,
             curves,
@@ -665,7 +753,7 @@ impl HardwareOperations for HardwareManager {
     }
 
     fn set_monitoring_auto_resume(&mut self, enabled: bool) -> Result<(), HardwareError> {
-        monitor_service::set_auto_resume(&mut self.monitor_store, enabled)
+        monitor_service::set_auto_resume(&mut *self.monitor_store.lock().unwrap(), enabled)
     }
 
     fn start_host_control(&mut self, policy: &HostControlPolicy) -> Result<(), HardwareError> {
@@ -779,6 +867,7 @@ mod tests {
         let id = DeviceId::new("aio");
         let channel = ChannelId::new("pump");
         let target = MonitorTarget::AioCurve {
+            source: TemperatureSource::Liquid,
             device_id: id.clone(),
             channel_id: channel,
             points: Vec::new(),

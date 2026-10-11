@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::DefaultProfile;
 use nzxt_cam_core::{
     ChannelId, CurvePoint, DeviceId, HostCurve, HostCurvePoint, HostTemperatureSource,
+    TemperatureSource,
+    curve::{kraken_temperature, valid_kraken_curve},
 };
 
 const PROFILE_FILE_VERSION: u64 = 2;
@@ -96,6 +98,16 @@ pub fn built_in_host_profiles(
         .collect()
 }
 
+pub fn built_in_kraken_profiles(source: TemperatureSource) -> Vec<CurveProfile> {
+    let mut profiles = built_in_profiles();
+    for profile in &mut profiles {
+        for (index, point) in profile.points.iter_mut().enumerate() {
+            point.temperature = kraken_temperature(source, index);
+        }
+    }
+    profiles
+}
+
 pub fn built_in_profiles() -> Vec<CurveProfile> {
     vec![
         CurveProfile::built_in(
@@ -166,7 +178,31 @@ pub enum ProfileRef {
 #[serde(rename_all = "snake_case")]
 pub enum ProfileCurve {
     Firmware(Vec<CurvePoint>),
+    Cpu(Vec<CurvePoint>),
     Host(HostCurve),
+}
+
+impl ProfileCurve {
+    pub fn kraken(source: TemperatureSource, points: Vec<CurvePoint>) -> Self {
+        if source == TemperatureSource::Cpu {
+            Self::Cpu(points)
+        } else {
+            Self::Firmware(points)
+        }
+    }
+    pub fn kraken_source(&self) -> Option<TemperatureSource> {
+        match self {
+            Self::Firmware(_) => Some(TemperatureSource::Liquid),
+            Self::Cpu(_) => Some(TemperatureSource::Cpu),
+            Self::Host(_) => None,
+        }
+    }
+    pub fn kraken_points(&self) -> Option<&Vec<CurvePoint>> {
+        match self {
+            Self::Firmware(points) | Self::Cpu(points) => Some(points),
+            Self::Host(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,10 +346,22 @@ impl ProfileLibrary {
                     kind: ProfileKind::Custom,
                     points: points.clone(),
                 }),
-                ProfileCurve::Host(_) => None,
+                ProfileCurve::Host(_) | ProfileCurve::Cpu(_) => None,
             })
             .collect()
     }
+    pub fn kraken_profiles(&self, source: TemperatureSource) -> Vec<CurveProfile> {
+        self.profiles
+            .iter()
+            .filter(|p| p.curve.kraken_source() == Some(source))
+            .map(|p| CurveProfile {
+                name: p.name.clone(),
+                kind: ProfileKind::Custom,
+                points: p.curve.kraken_points().unwrap().clone(),
+            })
+            .collect()
+    }
+
     fn allocate_id(&mut self) -> Result<u64, ProfileError> {
         let id = self.next_index;
         if id == 0 {
@@ -484,14 +532,17 @@ fn same_domain(a: &ProfileCurve, b: &ProfileCurve) -> bool {
     matches!(
         (a, b),
         (ProfileCurve::Firmware(_), ProfileCurve::Firmware(_))
+            | (ProfileCurve::Cpu(_), ProfileCurve::Cpu(_))
             | (ProfileCurve::Host(_), ProfileCurve::Host(_))
     )
 }
 fn domain_matches(target: &ProfileTarget, curve: &ProfileCurve) -> bool {
     matches!(
         (target, curve),
-        (ProfileTarget::Firmware { .. }, ProfileCurve::Firmware(_))
-            | (ProfileTarget::Host { .. }, ProfileCurve::Host(_))
+        (
+            ProfileTarget::Firmware { .. },
+            ProfileCurve::Firmware(_) | ProfileCurve::Cpu(_)
+        ) | (ProfileTarget::Host { .. }, ProfileCurve::Host(_))
     )
 }
 fn validate_target(target: &ProfileTarget) -> Result<(), ProfileError> {
@@ -510,6 +561,13 @@ fn validate_target(target: &ProfileTarget) -> Result<(), ProfileError> {
 fn validate_curve(curve: &ProfileCurve) -> Result<(), ProfileError> {
     match curve {
         ProfileCurve::Firmware(points) => validate_points(points),
+        ProfileCurve::Cpu(points) => {
+            if valid_kraken_curve(TemperatureSource::Cpu, points, 0) {
+                Ok(())
+            } else {
+                Err(invalid("invalid CPU Kraken curve"))
+            }
+        }
         ProfileCurve::Host(curve) => {
             if !(2..=64).contains(&curve.points.len()) {
                 return Err(invalid("host curves require 2..=64 points"));
@@ -1057,6 +1115,42 @@ mod tests {
             .prepare(&[intent(target("pump"), fw())])
             .unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cpu_profiles_round_trip_without_changing_existing_liquid_profiles() {
+        let mut library = ProfileLibrary::default();
+        let points = built_in_kraken_profiles(TemperatureSource::Cpu)[1]
+            .points
+            .clone();
+        let target = ProfileTarget::Firmware {
+            device_id: DeviceId::new("kraken"),
+            channel_id: ChannelId::new("pump"),
+        };
+        let prepared = library
+            .prepare(&[intent(target.clone(), ProfileCurve::Cpu(points.clone()))])
+            .unwrap();
+        library.bind_success(&prepared).unwrap();
+        let wire = serde_json::to_string(&library).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ProfileLibrary>(&wire).unwrap(),
+            library
+        );
+        assert!(library.firmware_profiles().is_empty());
+        assert_eq!(
+            library.kraken_profiles(TemperatureSource::Cpu)[0].points,
+            points
+        );
+        assert!(
+            library
+                .prepare(&[ProfileIntent {
+                    target,
+                    curve: fw(),
+                    preferred: Some(prepared[0].profile)
+                }])
+                .is_err()
+        );
+        assert_eq!(built_in_profiles()[1].points[39].temperature, 59);
     }
 
     #[test]

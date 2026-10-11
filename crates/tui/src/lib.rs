@@ -19,7 +19,8 @@ use backend::{BackendCancellation, BackendError, BackendErrorKind, HardwareBacke
 use config::{AppConfig, ConfigStore};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nzxt_cam_core::{
-    CurvePoint, DeviceId, HardwareSnapshot, HostChannelPolicy, HostControlPolicy, KrakenDisplayMode,
+    CurvePoint, DeviceId, HardwareSnapshot, HostChannelPolicy, HostControlPolicy,
+    KrakenDisplayMode, TemperatureSource,
 };
 use nzxt_cam_protocol::{
     MonitoringActivationOutcome, MonitoringDisplaySelection, MonitoringFirmwareCurve,
@@ -409,7 +410,7 @@ fn dispatch_curve(
             device_id: key.0.clone(),
             channel_id: key.1.clone(),
         },
-        curve: ProfileCurve::Firmware(request.points.clone()),
+        curve: ProfileCurve::kraken(request.source, request.points.clone()),
         preferred: request.profile,
     };
     let Some(mut bindings) = prepare_profiles(app, store, &[intent]) else {
@@ -481,12 +482,25 @@ fn send_app_command(
                 Err(error) => app.apply_failed(format!("App preference not saved: {error}")),
             }
         }
-        AppCommand::ApplyCurve {
-            key,
-            points,
-            profile,
-        } => {
-            let request = CurveRequest { points, profile };
+        AppCommand::ApplyCurve { .. } | AppCommand::ApplyCpuCurve { .. } => {
+            let (key, points, profile, source) = match command {
+                AppCommand::ApplyCurve {
+                    key,
+                    points,
+                    profile,
+                } => (key, points, profile, TemperatureSource::Liquid),
+                AppCommand::ApplyCpuCurve {
+                    key,
+                    points,
+                    profile,
+                } => (key, points, profile, TemperatureSource::Cpu),
+                _ => unreachable!(),
+            };
+            let request = CurveRequest {
+                points,
+                profile,
+                source,
+            };
             if let Some(pending) = pending_applies.get_mut(&key) {
                 pending.queued = Some(request);
                 app.curve_write_queued();
@@ -700,6 +714,7 @@ fn begin_graceful_exit(
 
 #[derive(Clone)]
 struct CurveRequest {
+    source: TemperatureSource,
     points: Vec<CurvePoint>,
     profile: Option<ProfileRef>,
 }
@@ -829,7 +844,13 @@ impl BackendWorker {
                             WorkerEvent::DisplaySet(backend.set_kraken_display(&device_id, mode))
                         }
                         WorkerCommand::ApplyCurve { key, request } => {
-                            let result = backend.apply_curve(&key.0, &key.1, &request.points);
+                            let result = if request.binding.curve.kraken_source()
+                                == Some(TemperatureSource::Cpu)
+                            {
+                                backend.apply_cpu_curve(&key.0, &key.1, &request.points)
+                            } else {
+                                backend.apply_curve(&key.0, &key.1, &request.points)
+                            };
                             WorkerEvent::Applied {
                                 key,
                                 request,
@@ -985,6 +1006,51 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.directory).unwrap();
         }
+    }
+
+    #[test]
+    fn cpu_apply_saves_the_cpu_domain_before_dispatch_and_binds_only_after_ack() {
+        let saved = TempProfiles::new();
+        let mut backend = crate::backend::DemoBackend::new();
+        let mut app = App::new(backend.refresh().unwrap(), "DEMO");
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let command = app
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let (worker, received, events) = recording_worker();
+        let mut pending = BTreeMap::new();
+        let mut state = HostOperationState::default();
+        send_app_command(
+            &mut app,
+            &worker,
+            Some(&saved.store),
+            &mut pending,
+            &mut state,
+            command,
+        );
+        let WorkerCommand::ApplyCurve { key, request } = received.try_recv().unwrap() else {
+            panic!("expected apply");
+        };
+        assert!(matches!(request.binding.curve, ProfileCurve::Cpu(_)));
+        assert_eq!(request.points[39].temperature, 100);
+        assert!(saved.store.load().unwrap().bindings.is_empty());
+        assert!(matches!(
+            saved.store.load().unwrap().profiles[0].curve,
+            ProfileCurve::Cpu(_)
+        ));
+        events
+            .send(WorkerEvent::Applied {
+                key,
+                request,
+                result: Ok(()),
+            })
+            .unwrap();
+        drain_events(&mut app, &worker, &saved.store, &mut pending, &mut state);
+        assert!(matches!(
+            saved.store.load().unwrap().bindings[0].curve,
+            ProfileCurve::Cpu(_)
+        ));
+        assert!(!app.is_active_curve_dirty());
     }
 
     fn fake_prepared(key: &CurveKey, points: Vec<CurvePoint>) -> PreparedCurveRequest {
@@ -1536,6 +1602,7 @@ mod tests {
             key,
             PendingApply {
                 queued: Some(CurveRequest {
+                    source: TemperatureSource::Liquid,
                     points,
                     profile: None,
                 }),

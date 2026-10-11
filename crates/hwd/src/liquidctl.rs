@@ -363,6 +363,19 @@ impl LiquidctlHardware {
         Ok(true)
     }
 
+    pub(crate) fn cooling_channel(
+        &self,
+        id: &DeviceId,
+        channel: &ChannelId,
+    ) -> Option<CoolingChannel> {
+        self.registry
+            .get(id)?
+            .channels
+            .iter()
+            .find(|c| &c.id == channel)
+            .cloned()
+    }
+
     fn cached_snapshot(&self) -> HardwareSnapshot {
         HardwareSnapshot {
             devices: self
@@ -398,6 +411,51 @@ impl LiquidctlHardware {
             }
         }
         Self::with_runner(Missing)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cooling_test_adapter(state: Arc<Mutex<CoolingTestState>>) -> Self {
+        struct Simulated(Arc<Mutex<CoolingTestState>>);
+        impl CommandRunner for Simulated {
+            fn run(&mut self, args: &[String]) -> Result<ProcessOutput, RunnerError> {
+                let mut state = self.0.lock().unwrap();
+                let text = if args == ["--json", "list"] {
+                    if state.offline {
+                        "[]"
+                    } else {
+                        r#"[{"description":"NZXT Kraken 2023","vendor_id":7793,"product_id":12302,"serial_number":"CPU-TEST","driver":"KrakenZ3","bus":"hid","address":"test"}]"#
+                    }
+                } else if args == ["--json", "status"] {
+                    if let Some((path, value)) = state.after_status.take() {
+                        std::fs::write(path, value).unwrap();
+                    }
+                    r#"[{"bus":"hid","address":"test","description":"NZXT Kraken 2023","status":[{"key":"Liquid temperature","value":30.0,"unit":"°C"},{"key":"Fan speed","value":900,"unit":"rpm"}]}]"#
+                } else {
+                    state.writes.push(args.to_vec());
+                    if state.fail_write {
+                        return Err(RunnerError::Io {
+                            kind: io::ErrorKind::Other,
+                            message: "simulated uncertain write".into(),
+                            started: true,
+                        });
+                    }
+                    ""
+                };
+                Ok(ProcessOutput {
+                    success: true,
+                    code: Some(0),
+                    stdout: CapturedOutput {
+                        bytes: text.as_bytes().to_vec(),
+                        truncated: false,
+                    },
+                    stderr: CapturedOutput {
+                        bytes: vec![],
+                        truncated: false,
+                    },
+                })
+            }
+        }
+        Self::with_runner(Simulated(state))
     }
 
     #[cfg(test)]
@@ -1231,6 +1289,15 @@ fn acquire_usb_lock<'a>(
             }
         }
     }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct CoolingTestState {
+    pub writes: Vec<Vec<String>>,
+    pub fail_write: bool,
+    pub offline: bool,
+    pub after_status: Option<(PathBuf, String)>,
 }
 
 trait CommandRunner: Send {

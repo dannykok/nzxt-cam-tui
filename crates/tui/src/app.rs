@@ -5,11 +5,11 @@ use nzxt_cam_core::{
     ChannelId, CoolingChannel, CurvePoint, CurveState, Device, DeviceId, HardwareSnapshot,
     HostChannelCapability, HostChannelPolicy, HostControlPolicy, HostControlState, HostCurve,
     HostCurvePoint, HostTemperatureSource, KrakenDisplayMode, ReadingKind, TemperatureSource,
+    curve::{kraken_temperature, valid_kraken_curve},
 };
 use nzxt_cam_protocol::{
-    MAX_MONITORING_FIRMWARE_CURVES, MONITORING_FIRMWARE_CURVE_POINTS, MonitoringActivationOutcome,
-    MonitoringActivationStatus, MonitoringActivationTarget, MonitoringDisplaySelection,
-    MonitoringFirmwareCurve,
+    MAX_MONITORING_FIRMWARE_CURVES, MonitoringActivationOutcome, MonitoringActivationStatus,
+    MonitoringActivationTarget, MonitoringDisplaySelection, MonitoringFirmwareCurve,
 };
 
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
     profile::{
         BuiltinProfile, CurveProfile, HostCurveProfile, MAX_PROFILE_NAME_CHARS, ProfileBinding,
         ProfileCurve, ProfileIntent, ProfileLibrary, ProfileRef, ProfileTarget,
-        built_in_host_profiles, built_in_profiles,
+        built_in_host_profiles, built_in_kraken_profiles, built_in_profiles,
     },
 };
 
@@ -189,6 +189,11 @@ impl HostPolicyEditor {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppCommand {
+    ApplyCpuCurve {
+        key: CurveKey,
+        points: Vec<CurvePoint>,
+        profile: Option<ProfileRef>,
+    },
     ApplyCurve {
         key: CurveKey,
         points: Vec<CurvePoint>,
@@ -376,8 +381,9 @@ impl App {
                                 channel_id: key.1.clone(),
                             }
                     })
-                    && let ProfileCurve::Firmware(points) = &binding.curve
+                    && let Some(points) = binding.curve.kraken_points()
                 {
+                    channel.source = binding.curve.kraken_source().unwrap();
                     channel.points = points.clone();
                     clamp_points(&mut channel.points, channel.min_duty, channel.max_duty);
                     active_profiles.insert(key, binding.profile);
@@ -495,8 +501,11 @@ impl App {
             Some(Modal::HostProfiles) => self.host_ref(self.profile_cursor),
             _ => None,
         };
-        self.profiles = built_in_profiles();
-        self.profiles.extend(library.firmware_profiles());
+        let source = self
+            .active_channel()
+            .map_or(TemperatureSource::Liquid, |c| c.source);
+        self.profiles = built_in_kraken_profiles(source);
+        self.profiles.extend(library.kraken_profiles(source));
         self.profile_library = library;
         if let Some(reference) = cursor_ref
             && let Some(index) = match self.modal {
@@ -521,7 +530,7 @@ impl App {
                         device_id,
                         channel_id,
                     },
-                    ProfileCurve::Firmware(points),
+                    ProfileCurve::Firmware(points) | ProfileCurve::Cpu(points),
                 ) => {
                     let key = (device_id.clone(), channel_id.clone());
                     if self.find_channel(&key).is_some_and(|c| c.points == *points)
@@ -616,7 +625,16 @@ impl App {
 
     fn firmware_ref(&self, index: usize) -> Option<ProfileRef> {
         self.profiles.get(index)?;
-        Some(profile_ref_for_index(&self.profile_library, index))
+        if index < 3 {
+            return Some(ProfileRef::BuiltIn(builtin_for_index(index)));
+        }
+        let source = self.active_channel()?.source;
+        self.profile_library
+            .profiles
+            .iter()
+            .filter(|p| p.curve.kraken_source() == Some(source))
+            .nth(index - 3)
+            .map(|p| ProfileRef::Custom(p.id))
     }
 
     fn host_ref(&self, index: usize) -> Option<ProfileRef> {
@@ -633,13 +651,23 @@ impl App {
     }
 
     fn firmware_reference_matches(&self, reference: ProfileRef, channel: &CoolingChannel) -> bool {
-        self.profile_library.name(reference).is_some() &&
-        match reference {
-            ProfileRef::BuiltIn(_) => self.profiles.iter().enumerate().find(|(i, _)| self.firmware_ref(*i) == Some(reference))
-                .is_some_and(|(_, profile)| profile_matches_channel(profile, channel)),
-            ProfileRef::Custom(id) => self.profile_library.profiles.iter().find(|p| p.id == id)
-                .is_some_and(|p| matches!(&p.curve, ProfileCurve::Firmware(points) if points_match_channel(points, channel))),
-        }
+        self.profile_library.name(reference).is_some()
+            && match reference {
+                ProfileRef::BuiltIn(builtin) => built_in_kraken_profiles(channel.source)
+                    .get(builtin_index(builtin))
+                    .is_some_and(|profile| profile_matches_channel(profile, channel)),
+                ProfileRef::Custom(id) => self
+                    .profile_library
+                    .profiles
+                    .iter()
+                    .find(|p| p.id == id)
+                    .is_some_and(|p| {
+                        p.curve.kraken_source() == Some(channel.source)
+                            && p.curve
+                                .kraken_points()
+                                .is_some_and(|points| points_match_channel(points, channel))
+                    }),
+            }
     }
 
     fn host_reference_matches(&self, reference: ProfileRef, channel: &HostEditorChannel) -> bool {
@@ -872,6 +900,7 @@ impl App {
             _ if self.editor_mode == EditorMode::Host => {
                 return self.handle_host_editor_key(key_event);
             }
+            KeyCode::Char('s' | 'S') => self.cycle_kraken_source(),
             KeyCode::Char('p' | 'P') => self.open_profile_picker(),
             KeyCode::Char('c' | 'C') | KeyCode::Char(']') => self.select_next_channel(),
             KeyCode::Char('[') => self.select_previous_channel(),
@@ -926,15 +955,9 @@ impl App {
             .flat_map(|d| {
                 d.cooling_channels
                     .iter()
-                    .filter(|c| {
-                        c.points.len() == MONITORING_FIRMWARE_CURVE_POINTS
-                            && c.points.iter().enumerate().all(|(index, point)| {
-                                point.temperature == 20 + index as u8
-                                    && (c.min_duty..=c.max_duty).contains(&point.duty)
-                            })
-                            && c.points.last().is_some_and(|point| point.duty == 100)
-                    })
+                    .filter(|c| valid_kraken_curve(c.source, &c.points, c.min_duty))
                     .map(move |c| MonitoringFirmwareCurve {
+                        source: c.source,
                         device_id: d.id.clone(),
                         channel_id: c.id.clone(),
                         points: c.points.clone(),
@@ -1741,6 +1764,7 @@ impl App {
     }
 
     fn open_profile_picker(&mut self) {
+        self.refresh_kraken_profiles();
         if self.active_channel().is_none() {
             return;
         }
@@ -1932,11 +1956,23 @@ impl App {
 
             for fresh_channel in &mut fresh_device.cooling_channels {
                 normalize_channel(fresh_channel);
+                let reported_source = fresh_channel.source;
                 let reported_points = fresh_channel.points.clone();
                 let key = (fresh_device.id.clone(), fresh_channel.id.clone());
                 if let Some(old_channel) = old_channels.remove(&fresh_channel.id) {
                     let dirty = self.dirty_curves.contains(&key);
+                    let source_edited = self.applied_curves.get(&key).is_some_and(|baseline| {
+                        baseline.first().map(|p| p.temperature)
+                            != old_channel.points.first().map(|p| p.temperature)
+                    });
                     if dirty || fresh_channel.curve_state == CurveState::Unverified {
+                        if source_edited
+                            || (fresh_channel.curve_state == CurveState::Unverified
+                                && fresh_channel.source == TemperatureSource::Liquid
+                                && old_channel.source == TemperatureSource::Cpu)
+                        {
+                            fresh_channel.source = old_channel.source;
+                        }
                         fresh_channel.points = old_channel.points;
                         clamp_points(
                             &mut fresh_channel.points,
@@ -1952,6 +1988,7 @@ impl App {
                     clamp_points(baseline, fresh_channel.min_duty, fresh_channel.max_duty);
                     if fresh_channel.curve_state == CurveState::Applied {
                         if dirty && fresh_channel.points == *baseline {
+                            fresh_channel.source = reported_source;
                             fresh_channel.points = reported_points.clone();
                             *baseline = reported_points;
                         } else if !dirty {
@@ -1969,7 +2006,8 @@ impl App {
                                     }
                             })
                         {
-                            if let ProfileCurve::Firmware(points) = &binding.curve {
+                            if let Some(points) = binding.curve.kraken_points() {
+                                fresh_channel.source = binding.curve.kraken_source().unwrap();
                                 fresh_channel.points = points.clone();
                                 clamp_points(
                                     &mut fresh_channel.points,
@@ -2097,6 +2135,22 @@ impl App {
             self.pending_confirmation = None;
             self.host_apply_scope = None;
         }
+        if let Some(error) = fresh
+            .monitoring
+            .targets
+            .iter()
+            .filter_map(|target| target.last_error.as_ref())
+            .find(|error| {
+                !self
+                    .snapshot
+                    .monitoring
+                    .targets
+                    .iter()
+                    .any(|old| old.last_error.as_ref() == Some(*error))
+            })
+        {
+            self.apply_failed(format!("Kraken cooling: {}", error.as_str()));
+        }
         self.snapshot_received = true;
         self.snapshot = HardwareSnapshot {
             devices,
@@ -2117,6 +2171,7 @@ impl App {
         }
         self.selected_point = selected_point;
         self.clamp_point();
+        self.refresh_kraken_profiles();
     }
 
     fn curve_send_message(&self) -> &'static str {
@@ -2386,9 +2441,7 @@ impl App {
             let old_duty = point.duty;
             // The firmware validator requires the 59°C endpoint at 100%.
             // Keep it fixed, and allow an older invalid draft to be repaired.
-            failsafe = point_index + 1 == channel.points.len()
-                && point.temperature == 59
-                && channel.max_duty == 100;
+            failsafe = point_index + 1 == channel.points.len() && channel.max_duty == 100;
             new_duty = if failsafe {
                 100
             } else {
@@ -2442,8 +2495,14 @@ impl App {
             return;
         };
         if let Some(channel) = self.find_channel_mut(&key) {
+            channel.source = if applied.first().is_some_and(|p| p.temperature == 22) {
+                TemperatureSource::Cpu
+            } else {
+                TemperatureSource::Liquid
+            };
             channel.points = applied;
         }
+        self.refresh_kraken_profiles();
         self.dirty_curves.remove(&key);
         self.status = StatusMessage::info("Unsaved edits were reset");
     }
@@ -2463,10 +2522,18 @@ impl App {
         } else {
             self.active_profiles.get(&key).copied()
         };
-        let command = AppCommand::ApplyCurve {
-            key: key.clone(),
-            points,
-            profile,
+        let command = if self.find_channel(&key)?.source == TemperatureSource::Cpu {
+            AppCommand::ApplyCpuCurve {
+                key: key.clone(),
+                points,
+                profile,
+            }
+        } else {
+            AppCommand::ApplyCurve {
+                key: key.clone(),
+                points,
+                profile,
+            }
         };
         if self.confirm_apply && self.backend_name != "DEMO" {
             let channel = self.find_channel(&key)?;
@@ -2566,7 +2633,46 @@ impl App {
         self.selected_point = self.selected_point.min(point_count.saturating_sub(1));
     }
 
+    fn refresh_kraken_profiles(&mut self) {
+        let source = self
+            .active_channel()
+            .map_or(TemperatureSource::Liquid, |c| c.source);
+        self.profiles = built_in_kraken_profiles(source);
+        self.profiles
+            .extend(self.profile_library.kraken_profiles(source));
+        self.profile_cursor = self
+            .profile_cursor
+            .min(self.profiles.len().saturating_sub(1));
+    }
+
+    fn cycle_kraken_source(&mut self) {
+        let Some(key) = self.active_curve_key() else {
+            return;
+        };
+        let Some(channel) = self.find_channel_mut(&key) else {
+            return;
+        };
+        if channel.points.len() != 40 {
+            self.apply_failed("Source selection requires a 40-point Kraken curve");
+            return;
+        }
+        channel.source = if channel.source == TemperatureSource::Liquid {
+            TemperatureSource::Cpu
+        } else {
+            TemperatureSource::Liquid
+        };
+        for (index, point) in channel.points.iter_mut().enumerate() {
+            point.temperature = kraken_temperature(channel.source, index);
+        }
+        let source = channel.source;
+        self.active_profiles.remove(&key);
+        self.sync_dirty_state(&key);
+        self.refresh_kraken_profiles();
+        self.status = StatusMessage::info(format!("Source {source} — draft only; Enter to apply"));
+    }
+
     fn announce_selection(&mut self) {
+        self.refresh_kraken_profiles();
         if let (Some(device), Some(channel)) = (self.active_device(), self.active_channel()) {
             self.status =
                 StatusMessage::info(format!("Editing {} / {}", device.name, channel.name));
@@ -2605,7 +2711,20 @@ fn profile_ref_for_index(library: &ProfileLibrary, index: usize) -> ProfileRef {
 }
 
 fn profile_matches_channel(profile: &CurveProfile, channel: &CoolingChannel) -> bool {
-    points_match_channel(&profile.points, channel)
+    if profile.kind == crate::profile::ProfileKind::BuiltIn {
+        let points: Vec<_> = profile
+            .points
+            .iter()
+            .enumerate()
+            .map(|(index, p)| CurvePoint {
+                temperature: kraken_temperature(channel.source, index),
+                duty: p.duty,
+            })
+            .collect();
+        points_match_channel(&points, channel)
+    } else {
+        points_match_channel(&profile.points, channel)
+    }
 }
 
 fn points_match_channel(points: &[CurvePoint], channel: &CoolingChannel) -> bool {
@@ -2767,6 +2886,39 @@ mod tests {
     fn app() -> App {
         let mut backend = DemoBackend::new();
         App::new(backend.refresh().unwrap(), backend.name())
+    }
+
+    #[test]
+    fn kraken_source_selection_is_a_per_channel_draft_and_survives_refresh() {
+        let mut backend = DemoBackend::new();
+        let fresh = backend.refresh().unwrap();
+        let mut app = App::new(fresh.clone(), "DEMO");
+        let baseline = app.active_channel().unwrap().points.clone();
+        assert!(app.handle_key_event(key(KeyCode::Char('s'))).is_none());
+        assert_eq!(app.active_channel().unwrap().source, TemperatureSource::Cpu);
+        assert_eq!(app.active_channel().unwrap().points[39].temperature, 100);
+        assert!(app.is_active_curve_dirty());
+        app.update_telemetry(fresh);
+        assert_eq!(app.active_channel().unwrap().source, TemperatureSource::Cpu);
+        let Some(AppCommand::ApplyCpuCurve { points, .. }) =
+            app.handle_key_event(key(KeyCode::Enter))
+        else {
+            panic!("expected CPU apply");
+        };
+        assert!(valid_kraken_curve(TemperatureSource::Cpu, &points, 20));
+        app.handle_key_event(key(KeyCode::Char('r')));
+        assert_eq!(
+            app.active_channel().unwrap().source,
+            TemperatureSource::Liquid
+        );
+        assert_eq!(app.active_channel().unwrap().points, baseline);
+        assert!(!app.is_active_curve_dirty());
+        app.handle_key_event(key(KeyCode::Char('s')));
+        app.handle_key_event(key(KeyCode::Char('c')));
+        assert_eq!(
+            app.active_channel().unwrap().source,
+            TemperatureSource::Liquid
+        );
     }
 
     fn opted_in(mut snapshot: HardwareSnapshot) -> HardwareSnapshot {

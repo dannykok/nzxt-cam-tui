@@ -1,13 +1,13 @@
 //! Minimal fixed-version handshake messages.
 //!
-//! The TUI and service are shipped together, so protocol v6 uses an exact
+//! The TUI and service are shipped together, so protocol v7 uses an exact
 //! version match rather than version-list negotiation. Rejections contain only
 //! a finite code and never carry peer-controlled diagnostic text.
 
 use serde::{Deserialize, Serialize};
 
 /// The fixed protocol version spoken by this release.
-pub const PROTOCOL_VERSION_V6: u16 = 6;
+pub const PROTOCOL_VERSION_V7: u16 = 7;
 
 /// The first frame sent by a client.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -17,11 +17,11 @@ pub struct ClientHello {
 }
 
 impl ClientHello {
-    /// Constructs the hello used by protocol-v6 clients.
+    /// Constructs the hello used by protocol-v7 clients.
     #[must_use]
-    pub const fn v6() -> Self {
+    pub const fn v7() -> Self {
         Self {
-            protocol_version: PROTOCOL_VERSION_V6,
+            protocol_version: PROTOCOL_VERSION_V7,
         }
     }
 
@@ -29,7 +29,7 @@ impl ClientHello {
     /// service.
     #[must_use]
     pub const fn is_supported(self) -> bool {
-        self.protocol_version == PROTOCOL_VERSION_V6
+        self.protocol_version == PROTOCOL_VERSION_V7
     }
 }
 
@@ -55,9 +55,9 @@ pub enum ServerResponse {
 impl ServerResponse {
     /// Constructs the only successful response supported by this release.
     #[must_use]
-    pub const fn ready_v6() -> Self {
+    pub const fn ready_v7() -> Self {
         Self::Ready {
-            protocol_version: PROTOCOL_VERSION_V6,
+            protocol_version: PROTOCOL_VERSION_V7,
         }
     }
 
@@ -72,21 +72,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_v6_messages_have_compact_round_trips() {
-        let hello = ClientHello::v6();
+    fn fixed_v7_messages_have_compact_round_trips() {
+        let hello = ClientHello::v7();
         let hello_json = serde_json::to_string(&hello).unwrap();
-        assert_eq!(hello_json, r#"{"protocol_version":6}"#);
+        assert_eq!(hello_json, r#"{"protocol_version":7}"#);
         assert_eq!(
             serde_json::from_str::<ClientHello>(&hello_json).unwrap(),
             hello
         );
 
         assert_eq!(
-            serde_json::to_string(&ServerResponse::ready_v6()).unwrap(),
-            r#"{"status":"ready","protocol_version":6}"#
+            serde_json::to_string(&ServerResponse::ready_v7()).unwrap(),
+            r#"{"status":"ready","protocol_version":7}"#
         );
         for response in [
-            ServerResponse::ready_v6(),
+            ServerResponse::ready_v7(),
             ServerResponse::rejected(RejectionCode::ServiceBusy),
             ServerResponse::rejected(RejectionCode::UnsupportedVersion),
             ServerResponse::rejected(RejectionCode::InvalidMessage),
@@ -101,9 +101,9 @@ mod tests {
     }
 
     #[test]
-    fn only_the_exact_v6_number_is_supported_at_u16_boundaries() {
-        assert!(ClientHello::v6().is_supported());
-        for protocol_version in [0, 1, 2, 3, 4, 5, PROTOCOL_VERSION_V6 + 1, u16::MAX] {
+    fn only_the_exact_v7_number_is_supported_at_u16_boundaries() {
+        assert!(ClientHello::v7().is_supported());
+        for protocol_version in [0, 1, 2, 3, 4, 5, 6, PROTOCOL_VERSION_V7 + 1, u16::MAX] {
             assert!(!ClientHello { protocol_version }.is_supported());
         }
     }

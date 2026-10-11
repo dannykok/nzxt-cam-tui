@@ -445,6 +445,7 @@ fn firmware_monitoring_warning(app: &App) -> Option<&'static str> {
                 device_id,
                 channel_id,
                 points: intent,
+                ..
             } if *device_id == key.0 && *channel_id == key.1 && intent == points => {
                 match target.actual_state {
                     MonitoringActualState::Pending => Some("QUEUED · NOT APPLIED"),
@@ -475,7 +476,17 @@ fn render_firmware_curve_editor(frame: &mut Frame, area: Rect, app: &App, theme:
     };
     let title = Line::from(vec![
         Span::styled(" CURVE LAB ", theme.selected),
-        Span::styled("  40-POINT FIRMWARE PROFILE ", theme.strong),
+        Span::styled(
+            if app
+                .active_channel()
+                .is_some_and(|c| c.source == nzxt_cam_core::TemperatureSource::Cpu)
+            {
+                " 40-POINT CPU · LIQUID GUARD "
+            } else {
+                "  40-POINT FIRMWARE PROFILE "
+            },
+            theme.strong,
+        ),
         Span::styled(
             state,
             if dirty || warning.is_some() {
@@ -591,7 +602,14 @@ fn render_curve_inspector(frame: &mut Frame, area: Rect, app: &App, theme: Theme
         ]),
         Line::from(vec![
             Span::styled("TEMP     ", theme.muted),
-            Span::styled("20–59 °C", theme.strong),
+            Span::styled(
+                if channel.source == nzxt_cam_core::TemperatureSource::Cpu {
+                    "22–100 °C"
+                } else {
+                    "20–59 °C"
+                },
+                theme.strong,
+            ),
         ]),
         Line::from(vec![
             Span::styled("DUTY     ", theme.muted),
@@ -616,6 +634,14 @@ fn render_curve_inspector(frame: &mut Frame, area: Rect, app: &App, theme: Theme
         Line::styled("", theme.text),
         Line::styled("SHIFT+↑/↓  ±5%", theme.muted),
         Line::styled("R           reset", theme.muted),
+        Line::styled(
+            if channel.source == nzxt_cam_core::TemperatureSource::Cpu {
+                "LIQUID SAFETY GUARD"
+            } else {
+                "S    Liquid / CPU"
+            },
+            theme.muted,
+        ),
     ];
     frame.render_widget(Paragraph::new(lines).style(theme.text), inner);
 }
@@ -868,6 +894,9 @@ fn curve_hints(
         }
         shortcuts.push(("O", "settings", "settings"));
     } else {
+        if has_channel && can_edit {
+            shortcuts.push(("S", "source", "src"));
+        }
         shortcuts.push(("Enter", "apply", "apply"));
     }
     let build = |compact| {
@@ -1258,7 +1287,14 @@ fn render_apply_confirmation(frame: &mut Frame, area: Rect, app: &App, theme: Th
         .border_type(BorderType::Double)
         .border_style(theme.error)
         .title(Line::styled(
-            " CONFIRM FIRMWARE CURVE WRITE ",
+            if app
+                .active_channel()
+                .is_some_and(|c| c.source == nzxt_cam_core::TemperatureSource::Cpu)
+            {
+                " CONFIRM CPU COOLING CHANGE "
+            } else {
+                " CONFIRM FIRMWARE CURVE WRITE "
+            },
             theme.selected,
         ))
         .padding(Padding::uniform(1));
@@ -1273,11 +1309,25 @@ fn render_apply_confirmation(frame: &mut Frame, area: Rect, app: &App, theme: Th
         .map_or("—", |channel| channel.name.as_str());
     let lines = vec![
         Line::styled(
-            "This will replace the device's stored cooling curve.",
+            if app
+                .active_channel()
+                .is_some_and(|c| c.source == nzxt_cam_core::TemperatureSource::Cpu)
+            {
+                "CPU cooling runs in the service with a liquid safety guard."
+            } else {
+                "This will replace the device's stored cooling curve."
+            },
             theme.strong,
         ),
         Line::styled(
-            "The previous firmware curve cannot be read back or restored automatically.",
+            if app
+                .active_channel()
+                .is_some_and(|c| c.source == nzxt_cam_core::TemperatureSource::Cpu)
+            {
+                "Sensor loss or service shutdown returns to liquid cooling."
+            } else {
+                "The previous firmware curve cannot be read back or restored automatically."
+            },
             theme.error,
         ),
         Line::styled("", theme.text),
@@ -1330,6 +1380,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         ),
         help_line("C or [ / ]", "Select cooling channel", theme),
         help_line("S", "Host: cycle source CPU/GPU/MAX", theme),
+        help_line("S", "Kraken: Liquid/CPU (liquid safety guard)", theme),
         help_line("Enter", "Opt in to monitoring / apply changes", theme),
         help_line("P", "Pick: host loads draft; firmware applies", theme),
         help_line("D", "Select Kraken 2023 display face", theme),
@@ -1419,6 +1470,21 @@ mod tests {
     }
 
     #[test]
+    fn cpu_kraken_view_labels_the_host_domain_and_autonomous_guard() {
+        let mut backend = DemoBackend::new();
+        let mut app = App::new(backend.refresh().unwrap(), "DEMO");
+        app.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        for (width, height) in [(88, 30), (120, 38)] {
+            let rendered = dashboard_rows(&app, width, height).join("\n");
+            assert!(rendered.contains("CPU · LIQUID GUARD"), "{rendered}");
+            assert!(rendered.contains("22–100 °C"), "{rendered}");
+        }
+    }
+
+    #[test]
     fn queued_firmware_intent_does_not_render_as_applied() {
         use nzxt_cam_core::{
             MonitoringActualState, MonitoringTargetIntent, MonitoringTargetSnapshot,
@@ -1428,6 +1494,7 @@ mod tests {
         snapshot.monitoring.opted_in = true;
         snapshot.monitoring.targets.push(MonitoringTargetSnapshot {
             intent: MonitoringTargetIntent::AioCurve {
+                source: nzxt_cam_core::TemperatureSource::Liquid,
                 device_id: snapshot.devices[0].id.clone(),
                 channel_id: snapshot.devices[0].cooling_channels[0].id.clone(),
                 points: snapshot.devices[0].cooling_channels[0].points.clone(),

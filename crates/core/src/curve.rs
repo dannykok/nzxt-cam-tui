@@ -86,12 +86,39 @@ impl fmt::Display for ChannelId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TemperatureSource {
+    #[default]
     Liquid,
     Cpu,
     Gpu,
+}
+
+impl TemperatureSource {
+    pub fn is_liquid(&self) -> bool {
+        *self == Self::Liquid
+    }
+}
+
+/// The editor uses 40 points in either coolant or host-temperature space.
+pub fn kraken_temperature(source: TemperatureSource, index: usize) -> u8 {
+    match source {
+        TemperatureSource::Liquid => 20 + index as u8,
+        TemperatureSource::Cpu => 22 + 2 * index as u8,
+        TemperatureSource::Gpu => 22 + 2 * index as u8,
+    }
+}
+
+pub fn valid_kraken_curve(source: TemperatureSource, points: &[CurvePoint], minimum: u8) -> bool {
+    matches!(source, TemperatureSource::Liquid | TemperatureSource::Cpu)
+        && points.len() == 40
+        && points.iter().enumerate().all(|(index, point)| {
+            point.temperature == kraken_temperature(source, index)
+                && (minimum..=100).contains(&point.duty)
+        })
+        && points.windows(2).all(|pair| pair[0].duty <= pair[1].duty)
+        && points.last().is_some_and(|point| point.duty == 100)
 }
 
 impl fmt::Display for TemperatureSource {
@@ -114,6 +141,27 @@ pub struct CurvePoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn liquid_and_cpu_curves_have_distinct_validated_domains() {
+        for source in [TemperatureSource::Liquid, TemperatureSource::Cpu] {
+            let mut points: Vec<_> = (0..40)
+                .map(|index| CurvePoint {
+                    temperature: kraken_temperature(source, index),
+                    duty: if index == 39 { 100 } else { 40 },
+                })
+                .collect();
+            assert!(valid_kraken_curve(source, &points, 20));
+            assert!(!valid_kraken_curve(TemperatureSource::Gpu, &points, 0));
+            points[0].duty = 19;
+            assert!(!valid_kraken_curve(source, &points, 20));
+            points[0].duty = 40;
+            points[39].duty = 99;
+            assert!(!valid_kraken_curve(source, &points, 0));
+        }
+        assert_eq!(kraken_temperature(TemperatureSource::Cpu, 39), 100);
+        assert_eq!(kraken_temperature(TemperatureSource::Liquid, 39), 59);
+    }
 
     #[test]
     fn firmware_curve_preserves_temperature_mapping_and_clamps_duties() {

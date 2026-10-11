@@ -1,13 +1,13 @@
 //! Hardware-operation data-transfer objects.
 //!
-//! These messages define the protocol-v6 operation surface shared by clients
+//! These messages define the protocol-v7 operation surface shared by clients
 //! and the hardware service.
 
 use std::fmt;
 
 use nzxt_cam_core::{
     ChannelId, CurvePoint, DeviceId, HardwareSnapshot, HostChannelPolicy, HostControlPolicy,
-    KrakenDisplayMode,
+    KrakenDisplayMode, TemperatureSource,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
@@ -78,6 +78,8 @@ pub const MAX_MONITORING_ACTIVATION_OUTCOMES: usize = MAX_MONITORING_FIRMWARE_CU
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MonitoringFirmwareCurve {
+    #[serde(default, skip_serializing_if = "TemperatureSource::is_liquid")]
+    pub source: TemperatureSource,
     pub device_id: DeviceId,
     pub channel_id: ChannelId,
     #[serde(
@@ -226,6 +228,11 @@ pub enum Request {
         device_id: DeviceId,
         mode: KrakenDisplayMode,
     },
+    ApplyCpuCurve {
+        device_id: DeviceId,
+        channel_id: ChannelId,
+        points: Vec<CurvePoint>,
+    },
     ApplyFirmwareCurve {
         device_id: DeviceId,
         channel_id: ChannelId,
@@ -266,6 +273,11 @@ impl<'de> Deserialize<'de> for Request {
                 device_id: DeviceId,
                 mode: KrakenDisplayMode,
             },
+            ApplyCpuCurve {
+                device_id: DeviceId,
+                channel_id: ChannelId,
+                points: Vec<CurvePoint>,
+            },
             ApplyFirmwareCurve {
                 device_id: DeviceId,
                 channel_id: ChannelId,
@@ -297,6 +309,15 @@ impl<'de> Deserialize<'de> for Request {
             WireRequest::SetKrakenDisplay { device_id, mode } => {
                 Self::SetKrakenDisplay { device_id, mode }
             }
+            WireRequest::ApplyCpuCurve {
+                device_id,
+                channel_id,
+                points,
+            } => Self::ApplyCpuCurve {
+                device_id,
+                channel_id,
+                points,
+            },
             WireRequest::ApplyFirmwareCurve {
                 device_id,
                 channel_id,
@@ -487,6 +508,36 @@ mod tests {
     }
 
     #[test]
+    fn cpu_curve_requests_and_activation_preserve_the_source_and_host_domain() {
+        let points: Vec<_> = (0..40)
+            .map(|index| CurvePoint {
+                temperature: 22 + 2 * index,
+                duty: if index == 39 { 100 } else { 50 },
+            })
+            .collect();
+        let request = Request::ApplyCpuCurve {
+            device_id: DeviceId::new("kraken"),
+            channel_id: ChannelId::new("pump"),
+            points: points.clone(),
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(wire.contains("apply_cpu_curve"));
+        assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), request);
+        let selected = MonitoringFirmwareCurve {
+            source: TemperatureSource::Cpu,
+            device_id: DeviceId::new("kraken"),
+            channel_id: ChannelId::new("pump"),
+            points,
+        };
+        let wire = serde_json::to_string(&selected).unwrap();
+        assert!(wire.contains("\"source\":\"cpu\""));
+        assert_eq!(
+            serde_json::from_str::<MonitoringFirmwareCurve>(&wire).unwrap(),
+            selected
+        );
+    }
+
+    #[test]
     fn request_variants_have_exact_json_and_round_trip() {
         assert_json_round_trip(&Request::GetSnapshot, r#"{"type":"get_snapshot"}"#);
         assert_json_round_trip(
@@ -542,6 +593,7 @@ mod tests {
             .collect();
         let request = Request::ActivateMonitoring {
             firmware_curves: vec![MonitoringFirmwareCurve {
+                source: TemperatureSource::Liquid,
                 device_id: DeviceId::new("aio"),
                 channel_id: ChannelId::new("pump"),
                 points,
@@ -648,6 +700,7 @@ mod tests {
         assert!(
             serde_json::to_value(Request::ActivateMonitoring {
                 firmware_curves: vec![MonitoringFirmwareCurve {
+                    source: TemperatureSource::Liquid,
                     device_id: DeviceId::new("aio"),
                     channel_id: ChannelId::new("pump"),
                     points: vec![]

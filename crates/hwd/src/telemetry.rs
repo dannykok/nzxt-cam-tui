@@ -50,6 +50,10 @@ impl HostTelemetry {
         }
     }
 
+    pub(crate) fn cpu_temperature_celsius(&self) -> Option<f64> {
+        sample_k10temp(&self.roots.hwmon).map(|value| value as f64 / 1_000.0)
+    }
+
     /// Samples CPU, NVIDIA, and IT8689 independently. An unavailable or invalid
     /// source contributes no readings and cannot suppress another source.
     pub fn sample_device(&mut self) -> Option<Device> {

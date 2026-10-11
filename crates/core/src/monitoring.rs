@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-use crate::{ChannelId, CurvePoint, DeviceId, KrakenDisplayMode};
+use crate::{ChannelId, CurvePoint, DeviceId, KrakenDisplayMode, TemperatureSource};
 
 /// Maximum diagnostic size on the monitoring snapshot wire, in UTF-8 bytes.
 pub const MAX_MONITORING_ERROR_BYTES: usize = 512;
@@ -53,6 +53,8 @@ impl<'de> Deserialize<'de> for MonitoringError {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MonitoringTargetIntent {
     AioCurve {
+        #[serde(default, skip_serializing_if = "TemperatureSource::is_liquid")]
+        source: TemperatureSource,
         device_id: DeviceId,
         channel_id: ChannelId,
         points: Vec<CurvePoint>,
@@ -119,6 +121,7 @@ mod tests {
             targets: vec![
                 MonitoringTargetSnapshot {
                     intent: MonitoringTargetIntent::AioCurve {
+                        source: TemperatureSource::Liquid,
                         device_id: DeviceId::new("aio"),
                         channel_id: ChannelId::new("pump"),
                         points: vec![CurvePoint {

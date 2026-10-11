@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 use nzxt_cam_core::{
     ChannelId, CurvePoint, DeviceId, HostControlPolicy, HostControlState, KrakenDisplayMode,
-    MonitoringActualState, MonitoringError,
+    MonitoringActualState, MonitoringError, TemperatureSource,
 };
 use nzxt_cam_protocol::{
     ErrorMessage, MAX_MONITORING_FIRMWARE_CURVES, MonitoringActivationOutcome,
@@ -45,12 +45,14 @@ pub(crate) trait MonitoringIo {
         id: &DeviceId,
         channel: &ChannelId,
         points: &[CurvePoint],
+        source: TemperatureSource,
     ) -> Result<bool, HardwareError>;
     fn write_curve(
         &mut self,
         id: &DeviceId,
         channel: &ChannelId,
         points: &[CurvePoint],
+        source: TemperatureSource,
     ) -> Result<(), HardwareError>;
     fn preflight_display(&mut self, id: &DeviceId) -> Result<(), HardwareError>;
     fn select_display(&mut self, id: DeviceId, mode: KrakenDisplayMode);
@@ -176,12 +178,18 @@ fn persist_selection<S: MonitoringStore>(
 pub(crate) fn write_curve<S: MonitoringStore>(
     store: &mut S,
     target: &MonitorTarget,
-    write: impl FnOnce(&DeviceId, &ChannelId, &[CurvePoint]) -> Result<(), HardwareError>,
+    write: impl FnOnce(
+        &DeviceId,
+        &ChannelId,
+        &[CurvePoint],
+        TemperatureSource,
+    ) -> Result<(), HardwareError>,
 ) -> Result<(), HardwareError> {
     let MonitorTarget::AioCurve {
         device_id,
         channel_id,
         points,
+        source,
     } = target
     else {
         return Err(HardwareError::with_kind(
@@ -190,7 +198,7 @@ pub(crate) fn write_curve<S: MonitoringStore>(
         ));
     };
     store.mark_in_flight(target)?;
-    write(device_id, channel_id, points)?;
+    write(device_id, channel_id, points, *source)?;
     match store.mark_ready(target) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -273,6 +281,7 @@ pub(crate) fn activate<S: MonitoringStore, I: MonitoringIo>(
             channel_id: curve.channel_id.clone(),
         };
         let target = MonitorTarget::AioCurve {
+            source: curve.source,
             device_id: curve.device_id.clone(),
             channel_id: curve.channel_id.clone(),
             points: curve.points.clone(),
@@ -297,7 +306,12 @@ pub(crate) fn activate<S: MonitoringStore, I: MonitoringIo>(
             ));
             continue;
         }
-        match io.preflight_curve(&curve.device_id, &curve.channel_id, &curve.points) {
+        match io.preflight_curve(
+            &curve.device_id,
+            &curve.channel_id,
+            &curve.points,
+            curve.source,
+        ) {
             Ok(true) => {
                 selected.push(SavedTarget {
                     target: target.clone(),
@@ -353,8 +367,8 @@ pub(crate) fn activate<S: MonitoringStore, I: MonitoringIo>(
     };
     persist_selection(store, &intent)?;
     for (index, target) in eligible {
-        let result = write_curve(store, &target, |id, channel, points| {
-            io.write_curve(id, channel, points)
+        let result = write_curve(store, &target, |id, channel, points, source| {
+            io.write_curve(id, channel, points, source)
         });
         record_write(actual, &target, &result);
         outcomes[index] = match result {
@@ -492,6 +506,7 @@ mod tests {
             _: &DeviceId,
             _: &ChannelId,
             _: &[CurvePoint],
+            _: TemperatureSource,
         ) -> Result<bool, HardwareError> {
             self.curve.clone()
         }
@@ -500,6 +515,7 @@ mod tests {
             _: &DeviceId,
             _: &ChannelId,
             _: &[CurvePoint],
+            _: TemperatureSource,
         ) -> Result<(), HardwareError> {
             self.events.borrow_mut().push("write".into());
             self.write.clone()
@@ -523,6 +539,7 @@ mod tests {
     }
     fn curve(id: &str) -> MonitoringFirmwareCurve {
         MonitoringFirmwareCurve {
+            source: TemperatureSource::Liquid,
             device_id: DeviceId::new(id),
             channel_id: ChannelId::new("pump"),
             points: (20..60)
@@ -535,6 +552,7 @@ mod tests {
     }
     fn target(curve: &MonitoringFirmwareCurve) -> MonitorTarget {
         MonitorTarget::AioCurve {
+            source: curve.source,
             device_id: curve.device_id.clone(),
             channel_id: curve.channel_id.clone(),
             points: curve.points.clone(),
@@ -721,7 +739,7 @@ mod tests {
         changed.points[0].duty = 46;
         update_selected(&mut store, target(&changed)).unwrap();
         store.fail_ready = true;
-        assert!(write_curve(&mut store, &target(&changed), |_, _, _| Ok(())).is_err());
+        assert!(write_curve(&mut store, &target(&changed), |_, _, _, _| Ok(())).is_err());
         assert_eq!(
             store.saved.as_ref().unwrap().targets[0].state,
             WriteState::InFlightUnknown

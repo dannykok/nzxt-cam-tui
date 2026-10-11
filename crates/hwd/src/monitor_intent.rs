@@ -11,7 +11,7 @@
 //! Provision /var/lib/nzxt-cam as root-owned mode 0700 before using the production
 //! store. A single writer is required: this module does not coordinate processes.
 use crate::hardware::{HardwareError, HardwareErrorKind};
-use nzxt_cam_core::{ChannelId, CurvePoint, DeviceId, KrakenDisplayMode};
+use nzxt_cam_core::{ChannelId, CurvePoint, DeviceId, KrakenDisplayMode, TemperatureSource};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -39,6 +39,8 @@ pub enum WriteState {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MonitorTarget {
     AioCurve {
+        #[serde(default, skip_serializing_if = "TemperatureSource::is_liquid")]
+        source: TemperatureSource,
         device_id: DeviceId,
         channel_id: ChannelId,
         points: Vec<CurvePoint>,
@@ -104,6 +106,7 @@ fn target_key(target: &MonitorTarget) -> Result<(u8, &str, Option<&str>), Hardwa
             device_id,
             channel_id,
             points,
+            ..
         } => {
             identity(&device_id.0)?;
             identity(&channel_id.0)?;
@@ -367,10 +370,34 @@ impl FileMonitorIntentStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_liquid_intent_defaults_safely_and_cpu_source_is_explicit() {
+        let old = r#"{"kind":"aio_curve","device_id":"kraken","channel_id":"pump","points":[{"temperature":20,"duty":40}]}"#;
+        let mut target: MonitorTarget = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            target,
+            MonitorTarget::AioCurve {
+                source: TemperatureSource::Liquid,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&target).unwrap(), old);
+        if let MonitorTarget::AioCurve { source, .. } = &mut target {
+            *source = TemperatureSource::Cpu;
+        }
+        let encoded = serde_json::to_string(&target).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MonitorTarget>(&encoded).unwrap(),
+            target
+        );
+    }
+
     use std::os::unix::{ffi::OsStrExt, fs::symlink};
 
     fn curve(device: &str, channel: &str) -> MonitorTarget {
         MonitorTarget::AioCurve {
+            source: TemperatureSource::Liquid,
             device_id: DeviceId::new(device),
             channel_id: ChannelId::new(channel),
             points: vec![
