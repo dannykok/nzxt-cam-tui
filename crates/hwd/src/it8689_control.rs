@@ -78,9 +78,10 @@ pub(crate) fn take_manual(
     Ok(())
 }
 
-/// Only fan4's mode 0 + actual PWM255 is a known manual alias. Never write 0.
+/// IT87 can report manual PWM255 as mode 0 on either allowlisted channel.
+/// Accept only the paired full-duty readback; never write mode 0 ourselves.
 pub(crate) fn manual_observed(channel: u8, mode: u8, pwm: u8) -> bool {
-    mode == 1 || channel == 4 && mode == 0 && pwm == 255
+    matches!(channel, 3 | 4) && (mode == 1 || mode == 0 && pwm == 255)
 }
 
 /// `controlled=false` permits read-only verification only. A failed BIOS
@@ -159,4 +160,28 @@ pub(crate) fn restore_one(
     verify_pwm(sysfs, channel, original)?;
     rpm(sysfs, channel, None)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_observation_accepts_only_allowlisted_modes_and_full_speed_pairs() {
+        for channel in [3, 4] {
+            for mode in 0..=u8::MAX {
+                for pwm in 0..=u8::MAX {
+                    assert_eq!(
+                        manual_observed(channel, mode, pwm),
+                        mode == 1 || mode == 0 && pwm == 255,
+                        "fan{channel} mode={mode} PWM={pwm}",
+                    );
+                }
+            }
+        }
+        for channel in [0, 1, 2, 5, 6, u8::MAX] {
+            assert!(!manual_observed(channel, 0, 255));
+            assert!(!manual_observed(channel, 1, 128));
+        }
+    }
 }

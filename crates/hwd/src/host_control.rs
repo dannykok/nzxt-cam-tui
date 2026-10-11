@@ -2642,6 +2642,7 @@ mod tests {
         panic_sample: bool,
         panic_writes: bool,
         fail_restore_writes: bool,
+        fan3_full_speed_alias: bool,
     }
 
     impl FakeState {
@@ -2823,10 +2824,13 @@ mod tests {
                 .get(&channel)
                 .copied()
                 .ok_or_else(|| unavailable("missing fake mode"))?;
-            // Match this kernel driver's mode alias: fan4 in manual mode at
-            // PWM 255 reads as full-speed mode 0, not mode 1.
+            // In-tree IT87 aliases fan4's manual PWM255 as mode 0; the
+            // newer out-of-tree IT8689 driver also aliases fan3.
             Ok(
-                if channel == 4 && mode == 1 && state.pwm.get(&channel) == Some(&255) {
+                if (channel == 4 || channel == 3 && state.fan3_full_speed_alias)
+                    && mode == 1
+                    && state.pwm.get(&channel) == Some(&255)
+                {
                     0
                 } else {
                     mode
@@ -5417,7 +5421,6 @@ mod tests {
         let mut sysfs = FakeSysfs(state.clone());
         assert_eq!(sysfs.read_enable(4).unwrap(), 0);
         assert!(control::manual_observed(4, 0, 255));
-        assert!(!control::manual_observed(3, 0, 255));
         drop(engine);
         restore_from_record(&mut sysfs, &mut FakeRecovery(state.clone())).unwrap();
         let fake = state.lock().unwrap();
@@ -5426,6 +5429,138 @@ mod tests {
         assert!(fake.record.is_none());
         assert!(fake.log.iter().any(|op| op == "write_pwm:4:63"));
     }
+    #[test]
+    fn full_speed_alias_tracks_gpu_curve_and_returns_to_lower_duty() {
+        for fan3_alias in [false, true] {
+            let (mut engine, state) = harness();
+            state.lock().unwrap().fan3_full_speed_alias = fan3_alias;
+            let selected = policy(HostTemperatureSource::Gpu);
+            engine.start(&selected).unwrap();
+            let mut sysfs = FakeSysfs(state.clone());
+
+            for seconds in [101, 102] {
+                let now = Duration::from_secs(seconds);
+                {
+                    let mut fake = state.lock().unwrap();
+                    fake.now = now;
+                    fake.last_sample = sample(now, Some(40_000), Some(80_000));
+                }
+                engine.tick(now).unwrap();
+                assert_eq!(engine.snapshot().state, HostControlState::Running);
+                assert_eq!(engine.snapshot().active_policy, Some(selected.clone()));
+                for channel in [3, 4] {
+                    assert_eq!(sysfs.read_pwm(channel).unwrap(), 255);
+                }
+                assert_eq!(sysfs.read_enable(3).unwrap(), u8::from(!fan3_alias));
+                assert_eq!(sysfs.read_enable(4).unwrap(), 0);
+            }
+
+            let now = Duration::from_secs(103);
+            {
+                let mut fake = state.lock().unwrap();
+                fake.now = now;
+                fake.last_sample = sample(now, Some(40_000), Some(40_000));
+            }
+            engine.tick(now).unwrap();
+            assert_eq!(engine.snapshot().state, HostControlState::Running);
+            for channel in [3, 4] {
+                // 52.5% after downward temperature hysteresis, rounded up.
+                assert_eq!(sysfs.read_pwm(channel).unwrap(), 134);
+                assert_eq!(sysfs.read_enable(channel).unwrap(), 1);
+            }
+            engine.stop().unwrap();
+            let fake = state.lock().unwrap();
+            assert_eq!(fake.enable, [(3, 2), (4, 2)].into());
+            assert_eq!(fake.pwm, [(3, 63), (4, 63)].into());
+            assert!(fake.record.is_none());
+            assert!(
+                !fake
+                    .log
+                    .iter()
+                    .any(|op| op.starts_with("write_enable:") && op.ends_with(":0"))
+            );
+        }
+    }
+
+    #[test]
+    fn full_speed_alias_restores_bios_on_stop_and_standalone_recovery() {
+        for fan3_alias in [false, true] {
+            for standalone in [false, true] {
+                let (mut engine, state) = harness();
+                state.lock().unwrap().fan3_full_speed_alias = fan3_alias;
+                engine.start(&policy(HostTemperatureSource::Gpu)).unwrap();
+                let now = Duration::from_secs(101);
+                {
+                    let mut fake = state.lock().unwrap();
+                    fake.now = now;
+                    fake.last_sample = sample(now, Some(40_000), Some(80_000));
+                }
+                engine.tick(now).unwrap();
+                let mut sysfs = FakeSysfs(state.clone());
+                assert_eq!(sysfs.read_enable(3).unwrap(), u8::from(!fan3_alias));
+                assert_eq!(sysfs.read_enable(4).unwrap(), 0);
+                let before_restore = state.lock().unwrap().log.len();
+                if standalone {
+                    drop(engine);
+                    restore_from_record(&mut sysfs, &mut FakeRecovery(state.clone())).unwrap();
+                } else {
+                    engine.stop().unwrap();
+                    assert_eq!(engine.snapshot().state, HostControlState::Available);
+                }
+                let fake = state.lock().unwrap();
+                assert_eq!(fake.enable, [(3, 2), (4, 2)].into());
+                assert_eq!(fake.pwm, [(3, 63), (4, 63)].into());
+                assert!(fake.record.is_none());
+                for channel in [3, 4] {
+                    assert!(
+                        fake.log[before_restore..].contains(&format!("write_pwm:{channel}:63"))
+                    );
+                    assert!(
+                        fake.log[before_restore..].contains(&format!("write_enable:{channel}:2"))
+                    );
+                }
+                assert!(
+                    !fake
+                        .log
+                        .iter()
+                        .any(|op| op.starts_with("write_enable:") && op.ends_with(":0"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mode_zero_below_full_duty_still_blocks_control_and_retains_recovery() {
+        for channel in [3, 4] {
+            let (mut engine, state) = harness();
+            state.lock().unwrap().fan3_full_speed_alias = true;
+            engine.start(&policy(HostTemperatureSource::Gpu)).unwrap();
+            let now = Duration::from_secs(101);
+            let before_fault = {
+                let mut fake = state.lock().unwrap();
+                fake.now = now;
+                fake.last_sample = sample(now, Some(40_000), Some(45_000));
+                fake.enable.insert(channel, 0);
+                assert_eq!(fake.pwm[&channel], 128);
+                fake.log.len()
+            };
+            assert_eq!(
+                engine.tick(now).unwrap_err().kind(),
+                HardwareErrorKind::RestoreRequired
+            );
+            assert_eq!(engine.snapshot().state, HostControlState::RestoreRequired);
+            let fake = state.lock().unwrap();
+            assert!(fake.record.is_some());
+            assert_eq!((fake.pwm[&channel], fake.enable[&channel]), (128, 0));
+            assert!(
+                !fake.log[before_fault..]
+                    .iter()
+                    .any(|op| op.starts_with(&format!("write_pwm:{channel}:"))
+                        || op.starts_with(&format!("write_enable:{channel}:")))
+            );
+        }
+    }
+
     fn persistent_engine(state: Arc<Mutex<FakeState>>, path: PathBuf) -> HostControlEngine {
         HostControlEngine::with_dependencies(
             Some(config()),
